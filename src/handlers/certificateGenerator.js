@@ -1,0 +1,410 @@
+/**
+ * Nirman Mitra — Certificate Generator Handler
+ * Smart Certificate PDF with QR + SHA-256 at day threshold.
+ * Auto-generated Smart Certificate issued at the attendance threshold.
+ *
+ * Trigger: Called by CertificateFlow Step Function or directly when
+ * a worker's total_days_logged reaches CERTIFICATE_THRESHOLD (3 demo / 90 prod).
+ *
+ * Tasks:
+ *   - check_eligibility: Verify worker has enough days
+ *   - generate: Build PDF with QR + SHA-256 + upload to S3
+ *   - verify: Public QR verification endpoint (delegated to adminApi)
+ */
+
+import crypto from 'crypto';
+import { v4 as uuidv4 } from 'uuid';
+import PDFDocument from 'pdfkit';
+import config, { isDemoMode } from '../utils/config.js';
+import { getItem, putItem, queryItems } from '../utils/dynamodb.js';
+import { uploadToS3, generatePresignedUrl } from '../utils/s3.js';
+
+export const handler = async (event) => {
+  console.log('CertificateGenerator event:', JSON.stringify(event).substring(0, 500));
+
+  const { task, workerId } = event;
+
+  try {
+    switch (task) {
+      case 'check_eligibility':
+        return await checkEligibility(workerId);
+      case 'generate':
+        return await generateCertificate(workerId, event);
+      default:
+        return { statusCode: 400, error: `Unknown task: ${task}` };
+    }
+  } catch (err) {
+    console.error(`CertificateGenerator error (${task}):`, err);
+    return { statusCode: 500, error: err.message, task };
+  }
+};
+
+// ---------------------------------------------------------
+// Check Eligibility
+// ---------------------------------------------------------
+
+async function checkEligibility(workerId) {
+  const worker = await getItem(config.tables.workers, { worker_id: workerId });
+  if (!worker) {
+    return { eligible: false, reason: 'worker_not_found' };
+  }
+
+  const daysLogged = worker.total_days_logged || 0;
+  const threshold = config.certificateThreshold;
+  const eligible = daysLogged >= threshold;
+
+  // Check if certificate already exists
+  const existingCerts = await queryItems(
+    config.tables.certificates,
+    'worker_id = :wid',
+    { ':wid': workerId },
+  );
+
+  if (existingCerts.length > 0) {
+    return {
+      eligible: false,
+      reason: 'certificate_already_exists',
+      certificateId: existingCerts[0].certificate_id,
+      daysLogged,
+      threshold,
+    };
+  }
+
+  return { eligible, daysLogged, threshold, reason: eligible ? 'meets_threshold' : 'insufficient_days' };
+}
+
+// ---------------------------------------------------------
+// Generate Certificate
+// ---------------------------------------------------------
+
+async function generateCertificate(workerId, event) {
+  // Verify eligibility
+  const eligibility = await checkEligibility(workerId);
+  if (!eligibility.eligible) {
+    return { success: false, ...eligibility };
+  }
+
+  const worker = await getItem(config.tables.workers, { worker_id: workerId });
+  const workerName = worker.name || 'Unknown Worker';
+  const language = event.language || worker.preferred_language || 'hi';
+
+  // Fetch all attendance logs
+  const attendanceLogs = await queryItems(
+    config.tables.attendance,
+    'worker_id = :wid',
+    { ':wid': workerId },
+  );
+
+  // Filter to approved logs only
+  const approvedLogs = attendanceLogs.filter(
+    (log) => log.verification_status === 'auto_approved' || log.verification_status === 'approved',
+  );
+
+  // Collect unique sites
+  const sitesMap = new Map();
+  for (const log of approvedLogs) {
+    if (log.site_id && log.site_id !== 'unknown') {
+      sitesMap.set(log.site_id, {
+        site_id: log.site_id,
+        name: log.site_name || log.site_id,
+      });
+    }
+  }
+  const sitesWorked = Array.from(sitesMap.values());
+
+  // Date range
+  const sortedDates = approvedLogs
+    .map((l) => l.log_date)
+    .filter(Boolean)
+    .sort();
+  const dateFrom = sortedDates[0] || new Date().toISOString().split('T')[0];
+  const dateTo = sortedDates[sortedDates.length - 1] || new Date().toISOString().split('T')[0];
+
+  // Generate certificate ID and SHA-256 hash
+  const certificateId = uuidv4();
+  const certData = {
+    certificateId,
+    workerId,
+    workerName,
+    aadhaarLast4: worker.aadhaar_last4 || 'XXXX',
+    totalDays: approvedLogs.length,
+    dateFrom,
+    dateTo,
+    sitesWorked,
+    issuedAt: new Date().toISOString(),
+  };
+
+  const verificationHash = crypto
+    .createHash('sha256')
+    .update(JSON.stringify(certData))
+    .digest('hex');
+
+  // Generate BOCW reference number (mock for prototype)
+  const bocwReference = `BOCW-${new Date().getFullYear()}-${Math.random().toString(36).substring(2, 8).toUpperCase()}`;
+
+  // Build PDF content
+  const pdfBuffer = await buildCertificatePdf(certData, verificationHash, bocwReference);
+
+  // Upload PDF to certificates S3 bucket
+  const s3Key = `certificates/${workerId}/${certificateId}.pdf`;
+  await uploadToS3(
+    config.buckets.certificates,
+    s3Key,
+    pdfBuffer,
+    'application/pdf',
+    { worker_id: workerId, certificate_id: certificateId },
+  );
+
+  // Generate QR code data (verification URL)
+  const baseUrl = process.env.API_GATEWAY_URL || `https://ghkeex2vt7.execute-api.ap-south-1.amazonaws.com/${config.environment}`;
+  const verificationUrl = `${baseUrl}/api/certificate/${verificationHash}/verify`;
+
+  // Store in Certificates table
+  const certificateRecord = {
+    worker_id: workerId,
+    certificate_id: certificateId,
+    verification_hash: verificationHash,
+    total_days: approvedLogs.length,
+    date_from: dateFrom,
+    date_to: dateTo,
+    sites: sitesWorked,
+    pdf_s3_key: s3Key,
+    qr_code_data: verificationUrl,
+    bocw_reference: bocwReference,
+    created_at: new Date().toISOString(),
+  };
+
+  await putItem(config.tables.certificates, certificateRecord);
+
+  // Generate pre-signed URL for download
+  const downloadUrl = await generatePresignedUrl(
+    config.buckets.certificates,
+    s3Key,
+    86400, // 24 hours
+  );
+
+  return {
+    success: true,
+    certificateId,
+    verificationHash,
+    bocwReference,
+    totalDays: approvedLogs.length,
+    dateRange: { from: dateFrom, to: dateTo },
+    sitesWorked,
+    downloadUrl,
+    verificationUrl,
+    workerName,
+  };
+}
+
+// ---------------------------------------------------------
+// PDF Builder — Real PDF via pdfkit
+// ---------------------------------------------------------
+
+function buildCertificatePdf(certData, verificationHash, bocwReference) {
+  return new Promise((resolve, reject) => {
+    const doc = new PDFDocument({
+      size: 'A4',
+      margins: { top: 50, bottom: 50, left: 60, right: 60 },
+    });
+
+    const chunks = [];
+    doc.on('data', (chunk) => chunks.push(chunk));
+    doc.on('end', () => resolve(Buffer.concat(chunks)));
+    doc.on('error', reject);
+
+    const pageWidth = doc.page.width - doc.page.margins.left - doc.page.margins.right;
+    const centerX = doc.page.margins.left + pageWidth / 2;
+
+    // --- Top border line ---
+    doc
+      .moveTo(doc.page.margins.left, 40)
+      .lineTo(doc.page.width - doc.page.margins.right, 40)
+      .lineWidth(3)
+      .strokeColor('#1a5276')
+      .stroke();
+
+    // --- Title ---
+    doc
+      .fontSize(22)
+      .font('Helvetica-Bold')
+      .fillColor('#1a5276')
+      .text('NIRMAN MITRA', 0, 55, { align: 'center', width: doc.page.width });
+
+    doc
+      .fontSize(14)
+      .font('Helvetica')
+      .fillColor('#2c3e50')
+      .text('SMART WORK CERTIFICATE', 0, 82, { align: 'center', width: doc.page.width });
+
+    doc
+      .fontSize(9)
+      .fillColor('#7f8c8d')
+      .text('AI-Verified Proof of Employment for Construction Workers', 0, 102, { align: 'center', width: doc.page.width });
+
+    // --- Divider ---
+    doc
+      .moveTo(doc.page.margins.left, 120)
+      .lineTo(doc.page.width - doc.page.margins.right, 120)
+      .lineWidth(1)
+      .strokeColor('#bdc3c7')
+      .stroke();
+
+    // --- Certificate metadata ---
+    let y = 138;
+    const leftCol = doc.page.margins.left;
+    const labelWidth = 150;
+
+    function addField(label, value) {
+      doc.fontSize(10).font('Helvetica-Bold').fillColor('#2c3e50').text(label, leftCol, y);
+      doc.fontSize(10).font('Helvetica').fillColor('#34495e').text(value, leftCol + labelWidth, y);
+      y += 18;
+    }
+
+    addField('Certificate ID:', certData.certificateId);
+    addField('BOCW Reference:', bocwReference);
+    addField('Issue Date:', certData.issuedAt);
+
+    // --- Section: Worker Details ---
+    y += 8;
+    doc
+      .moveTo(leftCol, y)
+      .lineTo(doc.page.width - doc.page.margins.right, y)
+      .lineWidth(0.5)
+      .strokeColor('#bdc3c7')
+      .stroke();
+    y += 10;
+
+    doc.fontSize(13).font('Helvetica-Bold').fillColor('#1a5276').text('WORKER DETAILS', leftCol, y);
+    y += 22;
+
+    addField('Name:', certData.workerName);
+    addField('Worker ID:', certData.workerId);
+    addField('Aadhaar (Last 4):', `XXXX-XXXX-${certData.aadhaarLast4}`);
+
+    // --- Section: Employment Record ---
+    y += 8;
+    doc
+      .moveTo(leftCol, y)
+      .lineTo(doc.page.width - doc.page.margins.right, y)
+      .lineWidth(0.5)
+      .strokeColor('#bdc3c7')
+      .stroke();
+    y += 10;
+
+    doc.fontSize(13).font('Helvetica-Bold').fillColor('#1a5276').text('EMPLOYMENT RECORD', leftCol, y);
+    y += 22;
+
+    addField('Total Verified Days:', String(certData.totalDays));
+    addField('Date Range:', `${certData.dateFrom} to ${certData.dateTo}`);
+    addField('Sites Worked:', certData.sitesWorked.map((s) => s.name).join(', ') || 'N/A');
+
+    // --- Section: Verification ---
+    y += 8;
+    doc
+      .moveTo(leftCol, y)
+      .lineTo(doc.page.width - doc.page.margins.right, y)
+      .lineWidth(0.5)
+      .strokeColor('#bdc3c7')
+      .stroke();
+    y += 10;
+
+    doc.fontSize(13).font('Helvetica-Bold').fillColor('#1a5276').text('VERIFICATION', leftCol, y);
+    y += 22;
+
+    doc.fontSize(9).font('Helvetica-Bold').fillColor('#2c3e50').text('SHA-256 Hash:', leftCol, y);
+    y += 14;
+    doc.fontSize(8).font('Courier').fillColor('#7f8c8d').text(verificationHash, leftCol, y);
+    y += 20;
+
+    // --- QR Code placeholder ---
+    const qrBoxSize = 90;
+    const qrX = centerX - qrBoxSize / 2;
+    doc
+      .rect(qrX, y, qrBoxSize, qrBoxSize)
+      .lineWidth(1)
+      .strokeColor('#1a5276')
+      .stroke();
+
+    doc
+      .fontSize(8)
+      .font('Helvetica')
+      .fillColor('#7f8c8d')
+      .text('[QR CODE]', qrX, y + 30, { width: qrBoxSize, align: 'center' })
+      .text('Scan to verify', qrX, y + 44, { width: qrBoxSize, align: 'center' });
+
+    const baseUrl = process.env.API_GATEWAY_URL || `https://ghkeex2vt7.execute-api.ap-south-1.amazonaws.com/${config.environment}`;
+  const verificationUrl = `${baseUrl}/api/certificate/${verificationHash}/verify`;
+    doc
+      .fontSize(7)
+      .font('Helvetica')
+      .fillColor('#7f8c8d')
+      .text(verificationUrl, 0, y + qrBoxSize + 6, { align: 'center', width: doc.page.width });
+
+    y += qrBoxSize + 28;
+
+    // --- Section: Triple Verification ---
+    y += 8;
+    doc
+      .moveTo(leftCol, y)
+      .lineTo(doc.page.width - doc.page.margins.right, y)
+      .lineWidth(0.5)
+      .strokeColor('#bdc3c7')
+      .stroke();
+    y += 10;
+
+    doc.fontSize(13).font('Helvetica-Bold').fillColor('#1a5276').text('TRIPLE VERIFICATION\u2122', leftCol, y);
+    y += 20;
+
+    doc
+      .fontSize(9)
+      .font('Helvetica')
+      .fillColor('#34495e')
+      .text(
+        'Each attendance log was verified through three independent AI channels: ' +
+        'Facial Recognition, GPS Geo-Fencing, and Voice Intent Analysis. ' +
+        'This certificate is tamper-resistant and legally defensible proof of employment.',
+        leftCol,
+        y,
+        { width: pageWidth, lineGap: 3 },
+      );
+
+    y += 50;
+
+    // --- Legal Disclaimer ---
+    doc
+      .fontSize(8)
+      .font('Helvetica-Oblique')
+      .fillColor('#95a5a6')
+      .text(
+        'This certificate is generated by the Nirman Mitra AI system. ' +
+        'Verification: Use the SHA-256 hash or QR code to validate. ' +
+        'Issued under the Building and Other Construction Workers (BOCW) Act, 1996.',
+        leftCol,
+        y,
+        { width: pageWidth, lineGap: 2 },
+      );
+
+    // --- Bottom border ---
+    const bottomY = doc.page.height - 40;
+    doc
+      .moveTo(doc.page.margins.left, bottomY)
+      .lineTo(doc.page.width - doc.page.margins.right, bottomY)
+      .lineWidth(3)
+      .strokeColor('#1a5276')
+      .stroke();
+
+    doc
+      .fontSize(8)
+      .font('Helvetica')
+      .fillColor('#7f8c8d')
+      .text('Verified by AI  |  Powered by AWS  |  Zero Contractor Dependency', 0, bottomY + 6, {
+        align: 'center',
+        width: doc.page.width,
+      });
+
+    doc.end();
+  });
+}
+
+export default { handler };

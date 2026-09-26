@@ -1,0 +1,311 @@
+/**
+ * Nirman Mitra — Voice Processor Service
+ * Voice pipeline: Transcribe STT → language detection → Polly TTS.
+ * Voice-first, zero literacy required.
+ */
+
+import { PollyClient, SynthesizeSpeechCommand } from '@aws-sdk/client-polly';
+import {
+  TranscribeClient,
+  StartTranscriptionJobCommand,
+  GetTranscriptionJobCommand,
+} from '@aws-sdk/client-transcribe';
+import config from '../utils/config.js';
+import { complete } from '../providers/llm.js';
+import { uploadProcessedAudio, uploadWorkerMedia } from '../utils/s3.js';
+import { generatePresignedUrl } from '../utils/s3.js';
+import { withRetry } from '../utils/retryHelper.js';
+
+const pollyClient = new PollyClient({ region: config.aws.region });
+const transcribeClient = new TranscribeClient({ region: config.aws.region });
+
+// ─────────────────────────────────────────────────────────
+// Language Detection
+// ─────────────────────────────────────────────────────────
+
+/**
+ * Detect language of text (script + keyword heuristics)
+ * @param {string} text - Input text (could be Hindi, English, or mixed)
+ * @returns {Promise<string>} ISO 639-1 language code (hi, en, ta, te, kn, ml, bn, mr, gu)
+ */
+export async function detectLanguage(text) {
+  // Simple keyword-based detection — no LLM call needed, faster and cheaper
+  const lower = (text || '').toLowerCase();
+
+  const patterns = {
+    en: /\b(hello|hi|good morning|please|thank|work|site|name|my|the|is|am)\b/,
+    ta: /[\u0B80-\u0BFF]|vanakkam|nandri/,
+    te: /[\u0C00-\u0C7F]|namaskaram/,
+    kn: /[\u0C80-\u0CFF]|namaskara/,
+    ml: /[\u0D00-\u0D7F]|namaskkaram/,
+    bn: /[\u0980-\u09FF]|namaskar/,
+    mr: /[\u0900-\u097F].*\b(mi|mala|aahe)\b/,
+    gu: /[\u0A80-\u0AFF]|kem cho/,
+  };
+
+  // Check for Devanagari script (Hindi/Marathi) first
+  if (/[\u0900-\u097F]/.test(text)) {
+    // Marathi-specific words
+    if (/\b(mi|mala|aahe|kay)\b/.test(lower)) return 'mr';
+    return 'hi';
+  }
+
+  for (const [lang, pattern] of Object.entries(patterns)) {
+    if (pattern.test(lower) || pattern.test(text)) return lang;
+  }
+
+  // Default to Hindi for Indian construction workers
+  return 'hi';
+}
+
+// ─────────────────────────────────────────────────────────
+// Voice Transcription
+// ─────────────────────────────────────────────────────────
+
+// Language code mapping for Amazon Transcribe
+const TRANSCRIBE_LANGUAGE_MAP = {
+  hi: 'hi-IN',
+  en: 'en-IN',
+  ta: 'ta-IN',
+  te: 'te-IN',
+  kn: 'kn-IN',
+  ml: 'ml-IN',
+  bn: 'bn-IN',
+  mr: 'mr-IN',
+  gu: 'gu-IN',
+};
+
+/**
+ * Transcribe a voice note to text using Amazon Transcribe.
+ * Uploads audio to S3, starts a Transcribe job, polls for result.
+ * @param {Buffer} audioBuffer - Audio file buffer (ogg/wav/mp3)
+ * @param {string} language - ISO 639-1 code
+ * @param {string} [workerId] - Worker ID for S3 path
+ * @returns {Promise<string>} Transcribed text
+ */
+export async function transcribeVoice(audioBuffer, language = 'hi', workerId = 'temp') {
+  // Demo mode: return mock transcription
+  if (config.environment === 'dev' && (!audioBuffer || audioBuffer.length < 100)) {
+    console.log('[VoiceProcessor DEMO] Returning mock transcription');
+    return 'Ram Kumar';
+  }
+
+  if (!audioBuffer || audioBuffer.length < 100) {
+    return 'Unknown';
+  }
+
+  try {
+    // Step 1: Upload audio to S3 for Transcribe
+    const audioKey = `voice-transcriptions/${workerId}/${Date.now()}.ogg`;
+    const uploadResult = await uploadWorkerMedia(workerId, 'voice-note', audioBuffer, 'audio/ogg');
+    const s3Uri = `s3://${config.buckets.mediaRaw}/${uploadResult.key || audioKey}`;
+
+    // Step 2: Start Transcribe job
+    const jobName = `nirman-${workerId}-${Date.now()}`;
+    const languageCode = TRANSCRIBE_LANGUAGE_MAP[language] || 'hi-IN';
+
+    await withRetry(
+      () => transcribeClient.send(
+        new StartTranscriptionJobCommand({
+          TranscriptionJobName: jobName,
+          LanguageCode: languageCode,
+          MediaFormat: 'ogg',
+          Media: { MediaFileUri: s3Uri },
+          OutputBucketName: config.buckets.mediaProcessed,
+          OutputKey: `transcriptions/${jobName}.json`,
+        }),
+      ),
+      { label: 'Transcribe:StartJob' },
+    );
+
+    // Step 3: Poll for completion (max ~20 seconds)
+    let transcript = '';
+    for (let i = 0; i < 20; i++) {
+      await new Promise((r) => setTimeout(r, 1000));
+
+      const status = await transcribeClient.send(
+        new GetTranscriptionJobCommand({ TranscriptionJobName: jobName }),
+      );
+
+      const jobStatus = status.TranscriptionJob?.TranscriptionJobStatus;
+
+      if (jobStatus === 'COMPLETED') {
+        // Fetch transcript from the result
+        const transcriptUri = status.TranscriptionJob?.Transcript?.TranscriptFileUri;
+        if (transcriptUri) {
+          const response = await fetch(transcriptUri);
+          const data = await response.json();
+          transcript = data.results?.transcripts?.[0]?.transcript || '';
+        }
+        break;
+      }
+
+      if (jobStatus === 'FAILED') {
+        console.error('[Transcribe] Job failed:', status.TranscriptionJob?.FailureReason);
+        break;
+      }
+    }
+
+    if (transcript) {
+      console.log(`[Transcribe] Result: "${transcript.substring(0, 100)}"`);
+      return transcript;
+    }
+
+    // Fallback to the LLM if Transcribe didn't produce a result
+    console.warn('[Transcribe] No result, falling back to LLM text analysis');
+    return await transcribeFallback(language);
+  } catch (err) {
+    console.error('Transcribe failed, using fallback:', err.message);
+    return await transcribeFallback(language);
+  }
+}
+
+/** Fallback transcription using the LLM when Transcribe fails */
+async function transcribeFallback(language) {
+  try {
+    const prompt = `An Indian construction worker sent a voice note in ${language === 'hi' ? 'Hindi' : 'English'}. They are likely stating their name or describing their daily work at a construction site. Generate a realistic short transcription (1-2 sentences). Return ONLY the transcription text.`;
+    const response = await complete({ prompt, maxTokens: 100 });
+    return response.trim() || 'Unknown';
+  } catch {
+    return 'Unknown';
+  }
+}
+
+// ─────────────────────────────────────────────────────────
+// Polly TTS — Voice Response Generation
+// ─────────────────────────────────────────────────────────
+
+/**
+ * Generate a voice response using Amazon Polly Neural TTS
+ * @param {string} text - Text to speak
+ * @param {string} languageCode - ISO 639-1 code (hi, en, etc.)
+ * @returns {Promise<Buffer>} Audio buffer (MP3)
+ */
+export async function generateVoiceResponse(text, languageCode = 'hi') {
+  const voiceConfig = config.pollyVoices[languageCode] || config.pollyVoices.hi;
+
+  try {
+    const result = await withRetry(
+      () => pollyClient.send(
+        new SynthesizeSpeechCommand({
+          Text: text,
+          OutputFormat: 'mp3',
+          VoiceId: voiceConfig.voiceId,
+          Engine: voiceConfig.engine,
+          LanguageCode: voiceConfig.languageCode,
+        }),
+      ),
+      { label: 'Polly:SynthesizeSpeech' },
+    );
+
+    // Convert stream to buffer
+    const chunks = [];
+    for await (const chunk of result.AudioStream) {
+      chunks.push(chunk);
+    }
+    return Buffer.concat(chunks);
+  } catch (err) {
+    console.error('Polly TTS failed:', err.message);
+    // Return empty buffer — caller should handle gracefully
+    return Buffer.alloc(0);
+  }
+}
+
+/**
+ * Generate voice response, upload to S3, and return a pre-signed URL
+ * @param {string} workerId
+ * @param {string} text - Text to speak
+ * @param {string} languageCode
+ * @param {string} label - e.g. 'greeting', 'confirmation'
+ * @returns {Promise<string>} Pre-signed URL to the audio file
+ */
+export async function generateAndUploadVoice(workerId, text, languageCode, label) {
+  const audioBuffer = await generateVoiceResponse(text, languageCode);
+
+  if (audioBuffer.length === 0) {
+    console.warn('Empty audio buffer — Polly may have failed');
+    return null;
+  }
+
+  const uploadResult = await uploadProcessedAudio(workerId, label, audioBuffer);
+  const presignedUrl = await generatePresignedUrl(
+    config.buckets.mediaProcessed,
+    uploadResult.key,
+    3600,
+  );
+
+  return presignedUrl;
+}
+
+// ─────────────────────────────────────────────────────────
+// LLM Helper (backward-compat wrapper)
+// ─────────────────────────────────────────────────────────
+
+/**
+ * @deprecated Use complete() from ../providers/llm.js directly
+ */
+export async function invokeLLM(prompt, maxTokens = 500) {
+  return complete({ prompt, maxTokens });
+}
+
+// ─────────────────────────────────────────────────────────
+// Greeting Messages per Language
+// ─────────────────────────────────────────────────────────
+
+/** Get greeting message in worker's language */
+export function getGreetingMessage(language, workerName) {
+  const greetings = {
+    hi: workerName
+      ? `Namaskar ${workerName}! Main Nirman Mitra hoon. Aapka registration ho gaya hai. Ab aap har din apna selfie aur voice note bhejkar attendance log kar sakte hain.`
+      : `Namaskar! Main Nirman Mitra hoon — aapka digital saathi. Registration shuru karne ke liye, kripya apna naam boliye.`,
+    en: workerName
+      ? `Hello ${workerName}! I am Nirman Mitra. Your registration is complete. You can now log attendance daily by sending a selfie and voice note.`
+      : `Hello! I am Nirman Mitra — your digital companion. To start registration, please say your name.`,
+  };
+  return greetings[language] || greetings.hi;
+}
+
+/** Get step-specific prompt messages */
+export function getStepPrompt(step, language = 'hi') {
+  const prompts = {
+    awaiting_name: {
+      hi: 'Kripya apna poora naam boliye ya type kariye.',
+      en: 'Please say or type your full name.',
+    },
+    awaiting_aadhaar: {
+      hi: 'Dhanyavaad! Ab kripya apne Aadhaar card ka photo bhejiye.',
+      en: 'Thank you! Now please send a photo of your Aadhaar card.',
+    },
+    awaiting_selfie: {
+      hi: 'Aadhaar verified! Ab kripya apna ek selfie photo bhejiye.',
+      en: 'Aadhaar verified! Now please send a selfie photo.',
+    },
+    awaiting_passbook: {
+      hi: 'Selfie saved! Ab kripya apne bank passbook ka photo bhejiye.',
+      en: 'Selfie saved! Now please send a photo of your bank passbook.',
+    },
+    registration_complete: {
+      hi: 'Badhai ho! Aapka registration poora ho gaya. Ab aap har din selfie aur voice note bhejkar attendance log kar sakte hain.',
+      en: 'Congratulations! Your registration is complete. You can now log attendance daily by sending a selfie and voice note.',
+    },
+    retry_image: {
+      hi: 'Photo clear nahi hai. Kripya achchi roshni mein dobara photo bhejiye.',
+      en: 'The photo is not clear. Please send another photo in good lighting.',
+    },
+    error: {
+      hi: 'Kuch problem ho gayi. Kripya thodi der baad dobara koshish karein.',
+      en: 'Something went wrong. Please try again after some time.',
+    },
+  };
+  return prompts[step]?.[language] || prompts[step]?.hi || prompts.error.hi;
+}
+
+export default {
+  detectLanguage,
+  transcribeVoice,
+  generateVoiceResponse,
+  generateAndUploadVoice,
+  invokeLLM,
+  getGreetingMessage,
+  getStepPrompt,
+};

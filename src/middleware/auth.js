@@ -1,0 +1,114 @@
+/**
+ * Nirman Mitra — Auth Middleware
+ * JWT verification, token generation, and password hashing.
+ */
+
+import jwt from 'jsonwebtoken';
+import bcrypt from 'bcryptjs';
+import { createHash, randomUUID } from 'crypto';
+import config from '../utils/config.js';
+import { putItem, getItem, deleteItem, queryItems } from '../utils/dynamodb.js';
+
+const SALT_ROUNDS = 12;
+
+/**
+ * Extract and verify the access token from the Authorization header.
+ * Returns decoded payload { admin_id, email, role } or null.
+ */
+export function verifyAccessToken(event) {
+  const authHeader = event.headers?.Authorization || event.headers?.authorization || '';
+  const match = authHeader.match(/^Bearer\s+(.+)$/i);
+  if (!match) return null;
+
+  try {
+    return jwt.verify(match[1], config.jwt.secret);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Check if the decoded token's role is in the allowed list.
+ * Returns true if allowed, false otherwise.
+ */
+export function requireRole(decodedToken, allowedRoles) {
+  if (!decodedToken || !decodedToken.role) return false;
+  return allowedRoles.includes(decodedToken.role);
+}
+
+/**
+ * Generate an access + refresh token pair for an admin.
+ * Stores the refresh token hash in DynamoDB.
+ */
+export async function generateTokenPair(admin) {
+  const accessToken = jwt.sign(
+    { admin_id: admin.admin_id, email: admin.email, role: admin.role },
+    config.jwt.secret,
+    { expiresIn: config.jwt.accessTokenExpiry },
+  );
+
+  const tokenId = randomUUID();
+  const refreshToken = jwt.sign(
+    { admin_id: admin.admin_id, token_id: tokenId },
+    config.jwt.refreshSecret,
+    { expiresIn: config.jwt.refreshTokenExpiry },
+  );
+
+  // Store hashed refresh token in DynamoDB
+  const hashedToken = createHash('sha256').update(refreshToken).digest('hex');
+  const ttl = Math.floor(Date.now() / 1000) + 7 * 24 * 60 * 60; // 7 days
+
+  await putItem(config.tables.refreshTokens, {
+    token_id: hashedToken,
+    admin_id: admin.admin_id,
+    expires_at: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(),
+    created_at: new Date().toISOString(),
+    ttl,
+  });
+
+  return { accessToken, refreshToken };
+}
+
+/**
+ * Hash a plaintext password using bcrypt.
+ */
+export async function hashPassword(password) {
+  return bcrypt.hash(password, SALT_ROUNDS);
+}
+
+/**
+ * Compare a plaintext password against a bcrypt hash.
+ */
+export async function comparePassword(password, hash) {
+  return bcrypt.compare(password, hash);
+}
+
+/**
+ * Look up a refresh token by its SHA-256 hash.
+ */
+export async function getRefreshToken(rawToken) {
+  const hashedToken = createHash('sha256').update(rawToken).digest('hex');
+  return getItem(config.tables.refreshTokens, { token_id: hashedToken });
+}
+
+/**
+ * Delete a refresh token by its SHA-256 hash.
+ */
+export async function deleteRefreshToken(rawToken) {
+  const hashedToken = createHash('sha256').update(rawToken).digest('hex');
+  return deleteItem(config.tables.refreshTokens, { token_id: hashedToken });
+}
+
+/**
+ * Look up an admin by email using the EmailIndex GSI.
+ */
+export async function getAdminByEmail(email) {
+  const items = await queryItems(
+    config.tables.adminUsers,
+    'email = :email',
+    { ':email': email },
+    'EmailIndex',
+    { Limit: 1 },
+  );
+  return items.length > 0 ? items[0] : null;
+}
