@@ -264,3 +264,10 @@ test('every voice request asks for the one-time number and does not advertise sk
   assert.match(viaSkip.replies[0], new RegExp(`number "${passcode}"`));
   assert.doesNotMatch(viaSkip.replies[0], /skip/i);
 });
+
+test('voice checks leave the model room to reason before the JSON answer', async () => {
+  await att({ task: 'voice_verify', workerId: 'x', voiceTranscription: 'ಇಂದು ನಾನು ಪೇಂಟಿಂಗ್ ಮಾಡಿದೆ ತೊಂಬತ್ತು', language: 'kn', passcode: 90 });
+  const request = H.llm.requests.at(-1);
+  assert.equal(request.reasoning_effort, 'low');
+  assert.ok(request.max_tokens >= 800, `max_tokens ${request.max_tokens} leaves no room for reasoning`);
+});

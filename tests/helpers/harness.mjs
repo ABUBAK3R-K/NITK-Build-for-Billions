@@ -56,7 +56,7 @@ Object.assign(process.env, {
 export const defaultLlmResponder = (prompt) => (prompt.includes('voice note')
   ? JSON.stringify({ is_work_related: true, activity: 'plaster', location_mention: '3rd floor', confidence: 90, passcode_match: true })
   : JSON.stringify({ intent: 'help', confidence: 80, passcode_match: true }));
-export const llm = { calls: [], responder: defaultLlmResponder };
+export const llm = { calls: [], requests: [], responder: defaultLlmResponder };
 export const transcribe = { text: 'aaj maine teesri manzil pe plaster kiya', fail: false, jobs: [] };
 const realFetch = globalThis.fetch;
 globalThis.fetch = async (url, opts) => {
@@ -74,6 +74,7 @@ globalThis.fetch = async (url, opts) => {
     const body = JSON.parse(opts.body);
     const prompt = body.messages.at(-1).content;
     llm.calls.push(prompt);
+    llm.requests.push(body);
     const content = llm.responder(prompt);
     return new Response(JSON.stringify({ choices: [{ message: { content } }] }), { status: 200 });
   }
