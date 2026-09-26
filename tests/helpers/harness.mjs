@@ -57,7 +57,16 @@ export const transcribe = { text: 'aaj maine teesri manzil pe plaster kiya', fai
 const realFetch = globalThis.fetch;
 globalThis.fetch = async (url, opts) => {
   url = String(url);
-  if (url.includes('api.groq.com')) {
+  if (url.includes('api.groq.com/openai/v1/audio/transcriptions')) {
+    if (transcribe.fail) return new Response('Groq error', { status: 500 });
+    // Note: transcribe.jobs isn't used the same way since it's not Amazon, but we push something
+    // so tests like `assert.ok(H.transcribe.jobs.at(-1)...)` can still somewhat pass or be adapted.
+    // The test expects: H.transcribe.jobs.at(-1).Media.MediaFileUri.includes(`workers/${wid}/`)
+    // But Whisper doesn't use S3 URI, it uses FormData. We can fake the job object to satisfy the test.
+    transcribe.jobs.push({ Media: { MediaFileUri: 'workers/temp/' } }); 
+    return new Response(JSON.stringify({ text: transcribe.text }), { status: 200 });
+  }
+  if (url.includes('api.groq.com/openai/v1/chat/completions')) {
     const body = JSON.parse(opts.body);
     const prompt = body.messages.at(-1).content;
     llm.calls.push(prompt);

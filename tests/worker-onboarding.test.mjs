@@ -148,7 +148,9 @@ test('name: a voice note is transcribed under the worker id and cleaned', async 
     H.transcribe.text = 'aaj maine teesri manzil pe plaster kiya';
   }
   assert.equal(H.worker(phone).name, 'Mohan Lal');
-  assert.ok(H.transcribe.jobs.at(-1).Media.MediaFileUri.includes(`workers/${wid}/`));
+  // We can't strictly assert the AWS Transcribe job details because we replaced it with Whisper,
+  // but we can check the audio was uploaded (which voiceProcessor still does)
+  assert.ok([...H.s3.keys()].some((k) => k.includes(`workers/${wid}/`) && k.includes('voice-note')));
 });
 
 test('language: namaskar is Hindi, not Bengali', async () => {
