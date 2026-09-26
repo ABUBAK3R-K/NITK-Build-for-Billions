@@ -27,6 +27,7 @@ import {
   sendTextMessage,
   sendAudioMessage,
   sendDocumentMessage,
+  sendImageMessage,
   sendLocationRequest,
 } from '../utils/whatsapp.js';
 import { uploadWorkerMedia, generatePresignedUrl } from '../utils/s3.js';
@@ -1278,6 +1279,9 @@ async function triggerCertificateGeneration(workerId, phoneNumber, language) {
         bocw_reference: result.bocwReference,
         pdf_s3_key: result.pdfS3Key,
       }, language);
+      if (result.signedCredential && result.qrS3Key) {
+        await sendCredentialQr(phoneNumber, result.qrS3Key, language);
+      }
     } else {
       console.log(`Certificate not generated for ${workerId}: ${result.reason || result.error}`);
     }
@@ -1285,6 +1289,17 @@ async function triggerCertificateGeneration(workerId, phoneNumber, language) {
     console.error('Certificate generation failed:', err.message);
     // Non-blocking: attendance is already logged, certificate can be retried
   }
+}
+
+/** Send the signed-credential QR as an image the worker can show a welfare board officer */
+async function sendCredentialQr(phoneNumber, qrS3Key, language = 'hi') {
+  const url = await generatePresignedUrl(config.buckets.certificates, qrS3Key, 900);
+  const caption = t(language, {
+    en: 'Show this QR code to the welfare board officer. They scan it to verify your work days.',
+    hi: 'Yeh QR code welfare board officer ko dikhaiye. Woh ise scan karke aapke kaam ke din verify karenge.',
+    kn: KN.credentialQrCaption,
+  });
+  await sendImageMessage(phoneNumber, url, caption);
 }
 
 /** Most recently issued certificate of a worker, or null */

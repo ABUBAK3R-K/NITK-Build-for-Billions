@@ -80,6 +80,7 @@ export const KN = {
   progress: (name, daysLogged, threshold, pct, daysRemaining) => `${name}, ನೀವು ${threshold} ದಿನಗಳಲ್ಲಿ ${daysLogged} ದಿನ ಹಾಜರಿ ಹಾಕಿದ್ದೀರಿ (${pct}%). ${daysRemaining > 0 ? `ಇನ್ನೂ ${daysRemaining} ದಿನ ಬಾಕಿ ಇದೆ.` : 'ನೀವು ಸರ್ಟಿಫಿಕೇಟ್ ಪಡೆಯಲು ಅರ್ಹರು!'}`,
   certificateNotReady: (name, daysRemaining) => `${name}, ಸರ್ಟಿಫಿಕೇಟ್‌ಗೆ ಇನ್ನೂ ${daysRemaining} ದಿನ ಬೇಕು. ಪ್ರತಿದಿನ ಹಾಜರಿ ಹಾಕುತ್ತಾ ಇರಿ!`,
   certificateReady: (ref) => `ಅಭಿನಂದನೆಗಳು! ನಿಮ್ಮ ಸ್ಮಾರ್ಟ್ ಸರ್ಟಿಫಿಕೇಟ್ ಸಿದ್ಧವಾಗಿದೆ! BOCW Ref: ${ref}. ಸರ್ಟಿಫಿಕೇಟ್ PDF ಕೆಳಗೆ ಕಳಿಸಲಾಗಿದೆ.`,
+  credentialQrCaption: 'ಈ QR ಕೋಡ್ ಅನ್ನು ಕಲ್ಯಾಣ ಮಂಡಳಿ ಅಧಿಕಾರಿಗೆ ತೋರಿಸಿ. ಅವರು ಇದನ್ನು ಸ್ಕ್ಯಾನ್ ಮಾಡಿ ನಿಮ್ಮ ಕೆಲಸದ ದಿನಗಳನ್ನು ಪರಿಶೀಲಿಸುತ್ತಾರೆ.',
   certificateCaption: (ref) => `ನಿರ್ಮಾಣ ಮಿತ್ರ ಸ್ಮಾರ್ಟ್ ಸರ್ಟಿಫಿಕೇಟ್${ref ? ` (BOCW Ref: ${ref})` : ''}`,
   logAttendanceGuide: 'ಹಾಜರಿ ಹಾಕಲು:\n1. ಸೆಲ್ಫಿ ಫೋಟೋ ಕಳಿಸಿ\n2. ಲೊಕೇಶನ್ ಕಳಿಸಿ (ಬಟನ್ ಒತ್ತಿ)\n3. ಕೆಲಸದ ಬಗ್ಗೆ ವಾಯ್ಸ್ ನೋಟ್ ಕಳಿಸಿ\n\nಮೊದಲು ಸೆಲ್ಫಿ ಕಳಿಸಿ!',
   greetingActive: (name, daysLogged) => `ನಮಸ್ಕಾರ ${name}! ನಾನು ನಿರ್ಮಾಣ ಮಿತ್ರ, ನಿಮ್ಮ ಡಿಜಿಟಲ್ ಸಂಗಾತಿ. ನೀವು ${daysLogged} ದಿನ ಹಾಜರಿ ಹಾಕಿದ್ದೀರಿ. ಹಾಜರಿಗೆ ಸೆಲ್ಫಿ ಕಳಿಸಿ, ಅಥವಾ ನಿಮ್ಮ ಪ್ರಗತಿ ಕೇಳಿ.`,
