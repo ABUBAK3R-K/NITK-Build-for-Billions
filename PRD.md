@@ -9,21 +9,21 @@
 **Problem.** Construction workers in India qualify for state welfare benefits only if they can prove days of work (typically 90 days in a year). That proof usually depends on a contractor's signature, which many workers cannot obtain.
 
 **Product.** Nirman Mitra ("builder's friend") is a voice-first WhatsApp assistant that lets a worker build that proof themselves:
+
 1. The worker checks in daily with a selfie, their location and a short voice note.
 2. Each check-in is verified automatically.
 3. When enough days are verified, the worker receives a **digitally signed work credential** with a QR code.
 4. A welfare board officer scans the QR and verifies the signature **in the browser, without contacting our server**, then approves the claim.
 
 **Positioning.**
+
 - Aadhaar proves who you are, UPI moves money, and DigiLocker holds documents. Nothing proves what work you did.
 - Nirman Mitra is a proof-of-work layer built on open credential standards and explicit consent.
 
----
-
-## 2. Users
+---## 2. Users
 
 | User | Needs | Constraints |
-|---|---|---|
+| --- | --- | --- |
 | **Construction worker** | Build verifiable proof of work days without a contractor; understand their progress; receive a credential | Low literacy, basic Android phone, WhatsApp already installed, intermittent network, prefers voice and their own language |
 | **Welfare board officer** | Trust a worker's claim quickly; see the attendance summary behind it; approve or reject | Needs to verify at a counter or in the field; cannot depend on a vendor's server being up |
 | **Program admin** | Monitor registrations and check-ins, review low-confidence check-ins, keep an audit trail | Must not see more personal data than needed |
@@ -45,11 +45,13 @@ A task is in scope only if it makes this story work better.
 ## 4. Functional requirements
 
 ### FR-1 Consent (WhatsApp)
+
 - Before any data is collected, send a purpose notice in the worker's language (Kannada, Hindi or English) with an interactive **I agree** reply button.
 - Store a consent record: worker ID, notice version, language, timestamp, channel.
 - Without consent, the bot collects no documents, images or voice.
 
 ### FR-2 Onboarding
+
 - Detect the language from the first message; the worker can change it later.
 - Capture the name by voice or text.
 - **Aadhaar:**
@@ -59,10 +61,11 @@ A task is in scope only if it makes this story work better.
 - **Image quality:** if a document image is poor, guide the worker by voice to retake it (up to 3 attempts, then flag for admin).
 
 ### FR-3 Daily check-in: triple verification
+
 Three independent checks run **in parallel**:
 
 | Check | Method | Catches |
-|---|---|---|
+| --- | --- | --- |
 | Face | Rekognition CompareFaces against the enrolled selfie | Proxy check-ins, wrong person |
 | Location | Haversine distance from the shared location to the nearest registered site geo-fence | Off-site check-ins |
 | Voice intent | Speech-to-text, then an LLM judges whether the note describes real work at the site | Empty or scripted check-ins |
@@ -70,7 +73,7 @@ Three independent checks run **in parallel**:
 **Confidence routing:**
 
 | Result | Condition |
-|---|---|
+| --- | --- |
 | **Auto-approved** | Face ≥ 60 and geo ≥ 60 |
 | **Rejected** | Face < 30, or distance beyond 2× the site radius |
 | **Pending review** | Anything else; queued for an admin |
@@ -82,6 +85,7 @@ Three independent checks run **in parallel**:
 **Reply:** text plus a spoken audio reply (Amazon Polly) with days logged and days remaining.
 
 ### FR-4 Signed work credential
+
 - Issued automatically when verified days reach `CERTIFICATE_THRESHOLD`.
 - **Format:** a JWT signed with **ES256**. Its claims include:
   - issuer DID
@@ -101,6 +105,7 @@ Three independent checks run **in parallel**:
 - The PDF keeps a SHA-256 fingerprint and a public verification link.
 
 ### FR-5 Officer verification portal
+
 - Scan a QR with the phone or laptop camera, or paste a token.
 - **In-browser verification:**
   - Resolve the issuer's did:web public key and verify the ES256 signature.
@@ -111,13 +116,16 @@ Three independent checks run **in parallel**:
 - **Target:** QR scan to "Verified" in under 5 seconds on a mid-range phone.
 
 ### FR-6 Admin dashboard
+
 - Login with JWT access and refresh tokens. The seed endpoint requires a seed secret.
 - Overview: workers, active or onboarding, days logged, pending reviews, trend charts.
 - Review queue: flagged check-ins with reasons and per-signal confidence; approve or reject with justification.
 - Worker search and profile, with the phone number masked.
 
 ### FR-7 Audit log
+
 Append-only audit entries for:
+
 - every officer view
 - every approve and reject decision
 - every admin view of a worker profile
@@ -125,6 +133,7 @@ Append-only audit entries for:
 Each entry records actor, action, subject, timestamp and outcome.
 
 ### FR-8 Languages
+
 - Demo path: **Kannada, Hindi and English**.
 - The roughly 15 Kannada strings on the demo path are hand-translated and checked by a native speaker.
 
@@ -133,7 +142,7 @@ Each entry records actor, action, subject, timestamp and outcome.
 ## 5. Non-functional requirements
 
 | Area | Requirement |
-|---|---|
+| --- | --- |
 | Latency | Check-in reply target: a few seconds, measured end to end before quoting any number. Credential verification under 5 s |
 | Privacy | Data minimisation: Aadhaar last 4 only; the phone number is masked in admin views; no Aadhaar image or number is ever sent to an LLM |
 | Security | Webhook requests authenticated with Meta's `X-Hub-Signature-256`; admin API behind JWT; secrets only in deployment parameters or secret stores, never in the repository; S3 encryption at rest (SSE-S3) |
@@ -164,6 +173,7 @@ Officer / Admin (browser) ──► React dashboard + officer portal (AWS Amplif
 ```
 
 **Stack:**
+
 - **Backend:** Node.js 20 on AWS Lambda, API Gateway, DynamoDB, S3, deployed with AWS SAM.
 - **AI:** Amazon Rekognition, Textract, Transcribe, Polly, and Groq (`openai/gpt-oss-120b`) behind a provider interface.
 - **Frontend:** React + Vite on AWS Amplify.
@@ -175,7 +185,7 @@ Officer / Admin (browser) ──► React dashboard + officer portal (AWS Amplif
 ## 7. Scope for this build
 
 | Piece | Scope | Owner |
-|---|---|---|
+| --- | --- | --- |
 | Signed credential | ES256 JWT, did:web document, real QR to `/verify#<token>` | Wasih |
 | Officer portal | QR scan, in-browser signature check, attendance summary, approve action, audit display | Abubaker |
 | Consent + audit log | WhatsApp consent button with purpose notice, consent record, audit entry on every officer/admin view | Shehzan / Wasih |
@@ -220,7 +230,7 @@ Officer / Admin (browser) ──► React dashboard + officer portal (AWS Amplif
 *Every number used in the pitch must carry its source. Fill in each source or remove the claim before submission.*
 
 | Claim | Source |
-|---|---|
+| --- | --- |
 | Number of registered construction workers in India | *to be sourced* |
 | Share of eligible workers receiving welfare benefits | *to be sourced* |
 | Welfare cess collected but unspent | *to be sourced* |
