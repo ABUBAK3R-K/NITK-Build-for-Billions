@@ -21,6 +21,7 @@ after(() => H.close());
 
 async function onboard(phone) {
   await send(phone, M.text('Namaste'));
+  await H.agree(phone);
   await send(phone, M.text('Ram Kumar'));
   await send(phone, M.image('a1'));
   await send(phone, M.image('s1'));
@@ -37,6 +38,7 @@ async function checkIn(phone) {
 test('a redelivered message id is processed only once', async () => {
   const phone = '919400000001';
   await send(phone, M.text('Namaste'));
+  await H.agree(phone);
   const first = await send(phone, M.text('Ram Kumar'), { id: 'wamid.dup-1' });
   assert.equal(first.replies.length > 0, true);
   const again = await send(phone, M.text('Ram Kumar'), { id: 'wamid.dup-1' });
@@ -72,7 +74,7 @@ test('reactions, stickers, unsupported and system messages do not register a wor
   assert.equal(H.worker(phone), undefined);
 });
 
-test('a greeting that failed to send does not make the next "hello" the name', async () => {
+test('a consent notice that failed to send does not make the next "hello" the name', async () => {
   const phone = '919400000006';
   H.wa.failSend = true;
   try {
@@ -83,7 +85,9 @@ test('a greeting that failed to send does not make the next "hello" the name', a
   }
   const r = await send(phone, M.text('Hello'));
   assert.equal(H.worker(phone).name, undefined);
-  assert.match(r.replies[0], /naam|name/i);
+  assert.match(r.replies[0], /^\[buttons\]/, 'the consent notice is sent again');
+  const agreed = await H.agree(phone);
+  assert.ok(agreed.replies.some((reply) => /naam|name/i.test(reply)), `asks for the name: ${agreed.replies}`);
   await send(phone, M.text('Ram Kumar'));
   assert.equal(H.worker(phone).name, 'Ram Kumar');
 });

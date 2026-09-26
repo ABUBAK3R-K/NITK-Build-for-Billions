@@ -422,6 +422,7 @@ export default {
   sendDocumentMessage,
   sendTemplateMessage,
   sendLocationRequest,
+  sendReplyButtons,
   downloadMedia,
   validateMetaSignature,
   parseWebhookMessage,

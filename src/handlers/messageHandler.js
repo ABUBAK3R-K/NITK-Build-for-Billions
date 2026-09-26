@@ -38,6 +38,14 @@ import {
 import { uploadWorkerMedia, generatePresignedUrl } from '../utils/s3.js';
 import { putItemIfAbsent } from '../services/conditionalWrite.js';
 import {
+  hasConsent,
+  isConsentReply,
+  sendConsentNotice,
+  consentRequiredText,
+  consentThanksText,
+  recordConsent,
+} from '../services/consent.js';
+import {
   handleGreeting,
   handleNameCapture,
   handleAadhaarUpload,
@@ -263,6 +271,12 @@ async function handleIncomingMessage(message) {
   const switchTo = message.type === 'text'
     ? LANGUAGE_BUTTONS[message.buttonId] || parseLanguageSwitch(message.text)
     : null;
+
+  // No documents, images or voice are collected until the worker agrees to the purpose notice
+  if (!hasConsent(existingWorker)) {
+    return await handleConsentGate(existingWorker, message, switchTo);
+  }
+
   if (switchTo) {
     return await handleLanguageSwitch(workerId, existingWorker, message, switchTo);
   }
@@ -286,7 +300,13 @@ async function handleIncomingMessage(message) {
 async function handleNewWorker(phoneNumber, message) {
   const textContent = message.text || message.caption || '';
 
-  const result = await handleGreeting(phoneNumber, textContent);
+  // Only the phone number and detected language are stored; the purpose notice comes first
+  const result = await handleGreeting(phoneNumber, textContent, { awaitConsent: true });
+
+  if (!result.isExisting) {
+    await sendConsentNotice(phoneNumber, result.language);
+    return apiResponse(200, { status: 'consent_requested', workerId: result.workerId });
+  }
 
   // Send response via WhatsApp
   await sendTextMessage(phoneNumber, result.responseText);
@@ -299,6 +319,59 @@ async function handleNewWorker(phoneNumber, message) {
     workerId: result.workerId,
     isExisting: result.isExisting,
   });
+}
+
+// ─────────────────────────────────────────────────────────
+// Consent gate (PRD FR-1): nothing is collected before "I agree"
+// ─────────────────────────────────────────────────────────
+
+async function handleConsentGate(worker, message, switchTo) {
+  const phoneNumber = message.from;
+  const workerId = worker.worker_id;
+  let language = worker.preferred_language || 'hi';
+
+  if (switchTo && switchTo !== language) {
+    language = switchTo;
+    await updateItem(
+      config.tables.workers,
+      { worker_id: workerId },
+      'SET preferred_language = :lang, updated_at = :ts',
+      { ':lang': language, ':ts': new Date().toISOString() },
+    );
+  }
+
+  if (!switchTo && isConsentReply(message)) {
+    await recordConsent(workerId, language);
+    await sendTextMessage(phoneNumber, consentThanksText(language));
+
+    // Continue where the worker is: a new worker starts registration with the name step
+    if (worker.profile_status === 'onboarding') {
+      const state = await getConversationState(workerId);
+      const step = !state?.current_step || state.current_step === 'awaiting_consent' ? 'awaiting_name' : state.current_step;
+      await saveConversationState(workerId, workerId, {
+        ...(state || {}),
+        current_step: step,
+        preferred_language: language,
+        retry_count: state?.retry_count || 0,
+      });
+      const next = step === 'awaiting_name' ? getGreetingMessage(language) : onboardingStepReminder(step, language);
+      if (next) await sendTextAndVoice(phoneNumber, workerId, next, language, 'consent-next');
+    } else {
+      await sendTextMessage(phoneNumber, t(language, {
+        en: 'You can continue: send a selfie to log today\'s attendance.',
+        hi: 'Ab aap aage badh sakte hain: aaj ki attendance ke liye selfie bhejiye.',
+        kn: KN.consentContinueActive,
+      }));
+    }
+    return apiResponse(200, { status: 'consent_recorded', workerId });
+  }
+
+  // Anything else (a photo, a voice note, text) is not stored: explain, then show the notice
+  if (!switchTo && message.type !== 'text') {
+    await sendTextMessage(phoneNumber, consentRequiredText(language));
+  }
+  await sendConsentNotice(phoneNumber, language);
+  return apiResponse(200, { status: 'consent_requested', workerId });
 }
 
 // ─────────────────────────────────────────────────────────

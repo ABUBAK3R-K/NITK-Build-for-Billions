@@ -13,6 +13,8 @@ async function activeWorker(workerId, phone, language = 'en') {
   await putItem(config.tables.workers, {
     worker_id: workerId, phone_number: phone, name: 'Ravi', profile_status: 'active',
     preferred_language: language, total_days_logged: 0,
+    // An active worker has already agreed to the purpose notice
+    consent_version: config.consentNoticeVersion, consent_language: language, consent_channel: 'whatsapp',
   });
 }
 
@@ -75,7 +77,7 @@ test('a Kannada "my days" phrase routes to the history', async () => {
 
 test('language: buttons are offered and the choice is saved', async () => {
   const { replies } = await send('918200000002', M.text('language'));
-  assert.ok(replies.includes('[interactive:button]'));
+  assert.ok(replies.some((r) => r.startsWith('[buttons] ')), `reply buttons offered: ${replies}`);
   const set = await send('918200000002', M.button('lang_kn', 'ಕನ್ನಡ'));
   assert.equal(H.worker('918200000002').preferred_language, 'kn');
   assert.match(set.replies[0], /ಕನ್ನಡಕ್ಕೆ/);
