@@ -37,7 +37,7 @@ function tableStore(tableName) {
 }
 
 const mockDb = {
-  async putItem(tableName, item) {
+  async putItem(tableName, item, conditionExpression) {
     // Derive primary key from item (first one or two defined key fields)
     const store = tableStore(tableName);
     const key = memKey(item.worker_id !== undefined
@@ -57,6 +57,9 @@ const mockDb = {
           : item.site_id !== undefined
             ? { site_id: item.site_id }
             : { _id: JSON.stringify(item) });
+    if (conditionExpression && /attribute_not_exists/i.test(conditionExpression) && store.has(key)) {
+      throw Object.assign(new Error('The conditional request failed'), { name: 'ConditionalCheckFailedException' });
+    }
     store.set(key, { ...item });
     console.log(`[MockDB] PUT ${tableName}[${key}]`);
     return item;
@@ -74,7 +77,7 @@ const mockDb = {
     const all = Array.from(store.values());
     // Simple linear scan: match items where the expression values appear in the item
     const results = all.filter(item =>
-      Object.entries(expressionValues).every(([placeholder, val]) => {
+      Object.entries(expressionValues).every(([_placeholder, val]) => {
         return Object.values(item).some(v => v === val);
       })
     );
@@ -115,7 +118,7 @@ const mockDb = {
     console.log(`[MockDB] DELETE ${tableName}[${k}]`);
   },
 
-  async scanTable(tableName, options = {}) {
+  async scanTable(tableName) {
     const items = Array.from(tableStore(tableName).values());
     console.log(`[MockDB] SCAN ${tableName} → ${items.length} item(s)`);
     return items;
@@ -139,10 +142,16 @@ const docClient = IS_DEMO ? null : DynamoDBDocumentClient.from(client, {
  * Put an item into a DynamoDB table
  * @param {string} tableName
  * @param {object} item
+ * @param {string} [conditionExpression] - e.g. 'attribute_not_exists(admin_id)'; a failed
+ *   condition throws ConditionalCheckFailedException
  */
-export async function putItem(tableName, item) {
-  if (IS_DEMO) return mockDb.putItem(tableName, item);
-  await docClient.send(new PutCommand({ TableName: tableName, Item: item }));
+export async function putItem(tableName, item, conditionExpression) {
+  if (IS_DEMO) return mockDb.putItem(tableName, item, conditionExpression);
+  await docClient.send(new PutCommand({
+    TableName: tableName,
+    Item: item,
+    ...(conditionExpression && { ConditionExpression: conditionExpression }),
+  }));
   return item;
 }
 
@@ -221,15 +230,51 @@ export async function deleteItem(tableName, key) {
   await docClient.send(new DeleteCommand({ TableName: tableName, Key: key }));
 }
 
+/** Safety cap on the number of items a full scan collects */
+const DEFAULT_SCAN_MAX_ITEMS = 10000;
+
 /**
- * Scan a table (use sparingly — prefer queries)
+ * Scan a whole table (use sparingly — prefer queries), following LastEvaluatedKey
+ * across pages until the table is exhausted or maxItems items have been collected.
  * @param {string} tableName
- * @param {object} [options]
+ * @param {object} [options] - Extra ScanCommand params (FilterExpression, etc.)
+ * @param {object} [scanOptions]
+ * @param {number} [scanOptions.maxItems=10000] - Stop after this many items
  */
-export async function scanTable(tableName, options = {}) {
-  if (IS_DEMO) return mockDb.scanTable(tableName, options);
+export async function scanTable(tableName, options = {}, { maxItems = DEFAULT_SCAN_MAX_ITEMS } = {}) {
+  if (IS_DEMO) return (await mockDb.scanTable(tableName, options)).slice(0, maxItems);
+  const items = [];
+  let startKey;
+  do {
+    const result = await docClient.send(new ScanCommand({
+      TableName: tableName,
+      ...options,
+      ...(startKey && { ExclusiveStartKey: startKey }),
+    }));
+    items.push(...(result.Items || []));
+    startKey = result.LastEvaluatedKey;
+  } while (startKey && items.length < maxItems);
+  if (items.length >= maxItems && startKey) {
+    console.warn(`[DynamoDB] scan of ${tableName} stopped at ${maxItems} items`);
+  }
+  return items.slice(0, maxItems);
+}
+
+/**
+ * Scan a single page of a table.
+ * @param {string} tableName
+ * @param {object} [options] - ScanCommand params (Limit, ExclusiveStartKey, ...)
+ * @returns {Promise<{ items: object[], lastEvaluatedKey: object|null }>}
+ */
+export async function scanPage(tableName, options = {}) {
+  if (IS_DEMO) {
+    const all = await mockDb.scanTable(tableName, options);
+    const start = options.ExclusiveStartKey ? Number(options.ExclusiveStartKey._offset) || 0 : 0;
+    const end = options.Limit ? start + options.Limit : all.length;
+    return { items: all.slice(start, end), lastEvaluatedKey: end < all.length ? { _offset: end } : null };
+  }
   const result = await docClient.send(new ScanCommand({ TableName: tableName, ...options }));
-  return result.Items || [];
+  return { items: result.Items || [], lastEvaluatedKey: result.LastEvaluatedKey || null };
 }
 
 // ─────────────────────────────────────────────────────────
@@ -310,6 +355,7 @@ export default {
   updateItem,
   deleteItem,
   scanTable,
+  scanPage,
   getWorkerByPhone,
   getConversationState,
   saveConversationState,

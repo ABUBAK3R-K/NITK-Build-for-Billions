@@ -6,6 +6,7 @@
 
 const DEFAULT_MAX_RETRIES = 3;
 const DEFAULT_BASE_DELAY_MS = 1000;
+const DEFAULT_MAX_DELAY_MS = 5000;
 
 /**
  * Retry a function with exponential backoff.
@@ -14,6 +15,7 @@ const DEFAULT_BASE_DELAY_MS = 1000;
  * @param {object} [options]
  * @param {number} [options.maxRetries=3]
  * @param {number} [options.baseDelayMs=1000]
+ * @param {number} [options.maxDelayMs=5000] - Upper bound for a single backoff wait
  * @param {string} [options.label=''] - Label for logging
  * @returns {Promise<*>} Result of fn()
  */
@@ -21,6 +23,7 @@ export async function withRetry(fn, options = {}) {
   const {
     maxRetries = DEFAULT_MAX_RETRIES,
     baseDelayMs = DEFAULT_BASE_DELAY_MS,
+    maxDelayMs = DEFAULT_MAX_DELAY_MS,
     label = '',
   } = options;
 
@@ -36,7 +39,7 @@ export async function withRetry(fn, options = {}) {
         throw err;
       }
 
-      const delay = baseDelayMs * Math.pow(2, attempt);
+      const delay = backoffDelay(attempt, baseDelayMs, maxDelayMs);
       console.warn(
         `[Retry${label ? ` ${label}` : ''}] Attempt ${attempt + 1}/${maxRetries} failed: ${err.message}. Retrying in ${delay}ms`,
       );
@@ -45,6 +48,15 @@ export async function withRetry(fn, options = {}) {
   }
 
   throw lastError;
+}
+
+/**
+ * Exponential backoff capped at maxDelayMs, with "equal jitter": a random wait between
+ * half and all of the capped delay, so concurrent callers do not retry in lockstep.
+ */
+export function backoffDelay(attempt, baseDelayMs = DEFAULT_BASE_DELAY_MS, maxDelayMs = DEFAULT_MAX_DELAY_MS) {
+  const capped = Math.min(maxDelayMs, baseDelayMs * Math.pow(2, attempt));
+  return Math.round(capped / 2 + Math.random() * (capped / 2));
 }
 
 /**
@@ -88,4 +100,4 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-export default { withRetry };
+export default { withRetry, backoffDelay };
