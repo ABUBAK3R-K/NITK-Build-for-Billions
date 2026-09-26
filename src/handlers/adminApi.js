@@ -29,6 +29,13 @@ import {
   getAdminByEmail,
   normalizeEmail,
 } from '../middleware/auth.js';
+import { writeAudit, listAudit, credentialSubject, workerSubject } from '../services/audit.js';
+import {
+  handleCompanyRoute,
+  handleAdminCompanyRoute,
+  parseSiteCompanyId,
+  CompanyError,
+} from './companyRoutes.js';
 
 /** Client error with a safe, generic message */
 class HttpError extends Error {
@@ -151,6 +158,15 @@ export const handler = async (event) => {
       return apiResponse(401, { error: 'Unauthorized — valid access token required' });
     }
 
+    // Company accounts are visibility-only: they reach /api/company/* and nothing else
+    if (admin.role === 'company') {
+      const companyResponse = await handleCompanyRoute(admin, event, path, method);
+      return companyResponse || apiResponse(403, { error: 'Forbidden — insufficient role' });
+    }
+    if (path.includes('/api/company/')) {
+      return apiResponse(403, { error: 'Forbidden — company accounts only' });
+    }
+
     // All /api/admin/* routes require admin or super_admin role
     if (path.includes('/api/admin/')) {
       if (!requireRole(admin, ['admin', 'super_admin'])) {
@@ -158,10 +174,30 @@ export const handler = async (event) => {
       }
     }
 
+    // Officer routes: welfare board officers (and admins) viewing and deciding on credentials
+    if (path.includes('/api/officer/')) {
+      if (!requireRole(admin, OFFICER_ROLES)) {
+        return apiResponse(403, { error: 'Forbidden — insufficient role' });
+      }
+      if (path.endsWith('/api/officer/view') && method === 'POST') {
+        return await recordOfficerView(event, admin);
+      }
+      if (path.endsWith('/api/officer/approve') && method === 'POST') {
+        return await recordOfficerDecision(event, admin);
+      }
+      if (path.includes('/api/officer/credential/') && path.endsWith('/audit') && method === 'GET') {
+        return await getCredentialAudit(path);
+      }
+      return apiResponse(404, { error: 'Route not found' });
+    }
+
     // Route to appropriate handler
     if (path.includes('/api/admin/dashboard')) {
       return await getDashboardStats();
     }
+
+    const companyAdminResponse = await handleAdminCompanyRoute(event, path, method);
+    if (companyAdminResponse) return companyAdminResponse;
 
     if (path.endsWith('/api/admin/sites')) {
       if (method === 'GET') return await listSites();
@@ -178,14 +214,17 @@ export const handler = async (event) => {
     }
 
     if (path.includes('/api/admin/review/') && method === 'PUT') {
-      return await handleReviewAction(event, path);
+      return await handleReviewAction(event, path, admin);
     }
 
     if (path.includes('/api/admin/worker/')) {
-      return await getWorkerProfile(event, path);
+      return await getWorkerProfile(event, path, admin);
     }
 
     if (path.includes('/api/worker/') && path.includes('/progress')) {
+      if (!requireRole(admin, ['admin', 'super_admin'])) {
+        return apiResponse(403, { error: 'Forbidden — insufficient role' });
+      }
       return await getWorkerProgress(path);
     }
 
@@ -203,7 +242,7 @@ export const handler = async (event) => {
 
     return apiResponse(404, { error: 'Route not found' });
   } catch (err) {
-    if (err instanceof HttpError) {
+    if (err instanceof HttpError || err instanceof CompanyError) {
       return apiResponse(err.statusCode, { error: err.message });
     }
     // Never echo internal error details to the client
@@ -248,6 +287,7 @@ async function handleLogin(event) {
       email: admin.email,
       name: admin.name,
       role: admin.role,
+      ...(admin.company_id && { company_id: admin.company_id, company_name: admin.company_name || admin.name }),
     },
   });
 }
@@ -564,7 +604,7 @@ function resolveLogKey(event, path, body) {
   return { workerId: logId, logDate: bodyLogDate };
 }
 
-async function handleReviewAction(event, path) {
+async function handleReviewAction(event, path, admin) {
   const body = parseBody(event);
   const action = optionalString(body.action);
   const justification = optionalString(body.justification);
@@ -599,12 +639,13 @@ async function handleReviewAction(event, path) {
     await updateItem(
       config.tables.attendance,
       { worker_id: workerId, log_date: logDate },
-      'SET verification_status = :status, admin_action = :action, admin_justification = :just, reviewed_at = :ts',
+      'SET verification_status = :status, admin_action = :action, admin_justification = :just, reviewed_at = :ts, reviewed_by = :by',
       {
         ':status': newStatus,
         ':action': action,
         ':just': sanitizedJustification,
         ':ts': new Date().toISOString(),
+        ':by': admin.admin_id,
         ':pending': 'pending_review',
       },
       undefined,
@@ -626,6 +667,14 @@ async function handleReviewAction(event, path) {
     }
   }
 
+  await writeAudit({
+    actor: `admin:${admin.admin_id}`,
+    action: 'attendance.decision',
+    subject: workerSubject(workerId),
+    outcome: action,
+    details: { log_date: logDate, justification: sanitizedJustification || null },
+  });
+
   return apiResponse(200, {
     success: true,
     logId,
@@ -639,10 +688,16 @@ async function handleReviewAction(event, path) {
 // GET /api/admin/worker/{id} — Worker Profile
 // ─────────────────────────────────────────────────────────
 
-async function getWorkerProfile(event, path) {
+async function getWorkerProfile(event, path, admin) {
   const workerId = safeDecode(event.pathParameters?.id ?? path.split('/').pop());
 
   const worker = await getItem(config.tables.workers, { worker_id: workerId });
+  await writeAudit({
+    actor: `admin:${admin.admin_id}`,
+    action: 'worker.view',
+    subject: workerSubject(workerId),
+    outcome: worker ? 'ok' : 'not_found',
+  });
   if (!worker) {
     return apiResponse(404, { error: 'Worker not found' });
   }
@@ -661,6 +716,8 @@ async function getWorkerProfile(event, path) {
     registration_completed: worker.registration_completed || null,
     admin_flag: worker.admin_flag || null,
     admin_flag_reason: worker.admin_flag_reason || null,
+    consent_version: worker.consent_version || null,
+    consent_at: worker.consent_at || null,
     created_at: worker.created_at || null,
     updated_at: worker.updated_at || null,
   };
@@ -674,6 +731,127 @@ async function getWorkerProfile(event, path) {
       ocr_confidence: d.ocr_confidence,
       created_at: d.created_at,
     })),
+  });
+}
+
+// ─────────────────────────────────────────────────────────
+// Officer: credential views and decisions (PRD FR-5, FR-7)
+// The signature is verified in the officer's browser; these routes only record who looked
+// at a credential and what they decided.
+// ─────────────────────────────────────────────────────────
+
+const OFFICER_ROLES = ['officer', 'admin', 'super_admin'];
+const DECISIONS = ['approve', 'reject'];
+const MAX_NOTE_LENGTH = 500;
+
+/** A credential id (jti) is the certificate id: a UUID */
+function parseJti(value) {
+  const jti = optionalString(value);
+  if (!jti || !/^[A-Za-z0-9-]{8,64}$/.test(jti)) {
+    throw new HttpError(400, 'Invalid or missing jti');
+  }
+  return jti;
+}
+
+async function findCertificate(jti) {
+  const items = await queryItems(
+    config.tables.certificates,
+    'certificate_id = :c',
+    { ':c': jti },
+    'CertificateIdIndex',
+    { Limit: 1 },
+  );
+  return items[0] || null;
+}
+
+/** The recorded decision for a credential, if any (one per credential) */
+async function getDecision(jti) {
+  return getItem(config.tables.audit, { subject: credentialSubject(jti), entry_id: 'decision' });
+}
+
+// POST /api/officer/view { jti }
+async function recordOfficerView(event, officer) {
+  const body = parseBody(event);
+  const jti = parseJti(body.jti);
+  const certificate = await findCertificate(jti);
+
+  await writeAudit({
+    actor: `admin:${officer.admin_id}`,
+    action: 'credential.view',
+    subject: credentialSubject(jti),
+    outcome: certificate ? 'ok' : 'not_found',
+  });
+  if (!certificate) {
+    return apiResponse(404, { error: 'Credential not found' });
+  }
+
+  const decision = await getDecision(jti);
+  return apiResponse(200, {
+    recorded: true,
+    decision: decision ? { decision: decision.decision, at: decision.at } : null,
+  });
+}
+
+// POST /api/officer/approve { jti, decision: 'approve' | 'reject', note }
+async function recordOfficerDecision(event, officer) {
+  const body = parseBody(event);
+  const jti = parseJti(body.jti);
+  const decision = optionalString(body.decision);
+  if (!DECISIONS.includes(decision)) {
+    return apiResponse(400, { error: 'Invalid decision. Must be "approve" or "reject".' });
+  }
+  const note = sanitizeString(optionalString(body.note) || '').slice(0, MAX_NOTE_LENGTH);
+
+  const certificate = await findCertificate(jti);
+  if (!certificate) {
+    return apiResponse(404, { error: 'Credential not found' });
+  }
+
+  // One decision per credential: an insert-only record, so a second decision fails
+  const at = new Date().toISOString();
+  try {
+    await putItem(config.tables.audit, {
+      subject: credentialSubject(jti),
+      entry_id: 'decision',
+      actor: `admin:${officer.admin_id}`,
+      action: 'credential.decision',
+      decision,
+      note: note || null,
+      worker_id: certificate.worker_id,
+      at,
+    }, 'attribute_not_exists(entry_id)');
+  } catch (err) {
+    if (err.name === 'ConditionalCheckFailedException') {
+      const existing = await getDecision(jti);
+      return apiResponse(409, {
+        error: `This claim was already ${existing?.decision === 'approve' ? 'approved' : 'rejected'}.`,
+        decision: existing ? { decision: existing.decision, at: existing.at } : null,
+      });
+    }
+    throw err;
+  }
+
+  await writeAudit({
+    actor: `admin:${officer.admin_id}`,
+    action: 'credential.decision',
+    subject: credentialSubject(jti),
+    outcome: decision,
+    details: { note: note || null },
+  });
+
+  return apiResponse(200, { success: true, jti, decision, at });
+}
+
+// GET /api/officer/credential/{jti}/audit — the credential's audit trail for the portal
+async function getCredentialAudit(path) {
+  const parts = path.split('/');
+  const jti = parseJti(safeDecode(parts[parts.length - 2]));
+  const entries = await listAudit(credentialSubject(jti));
+  return apiResponse(200, {
+    jti,
+    entries: entries
+      .filter((e) => e.entry_id !== 'decision')
+      .map((e) => ({ at: e.at, actor: e.actor, action: e.action, outcome: e.outcome })),
   });
 }
 
@@ -774,6 +952,7 @@ function siteView(site) {
     longitude: site.geo_location?.longitude ?? null,
     radius_meters: site.radius_meters ?? null,
     is_active: site.is_active === 'true' || site.is_active === true,
+    ...(site.company_id && { company_id: site.company_id }),
     created_at: site.created_at || null,
     updated_at: site.updated_at || null,
   };
@@ -814,6 +993,9 @@ async function upsertSite(event) {
     else throw badRequest('is_active must be a boolean');
   }
 
+  // Optional owning company (visibility only); '' or null removes it
+  const companyId = parseSiteCompanyId(body.company_id);
+
   const siteId = siteIdInput || `SITE-${randomUUID()}`;
   const existing = siteIdInput ? await getItem(config.tables.sites, { site_id: siteId }) : null;
   const now = new Date().toISOString();
@@ -829,6 +1011,8 @@ async function upsertSite(event) {
     updated_at: now,
   };
   delete site.name;
+  if (companyId === null) delete site.company_id;
+  else if (companyId !== undefined) site.company_id = companyId;
 
   await putItem(config.tables.sites, site);
   return apiResponse(existing ? 200 : 201, { site: siteView(site), created: !existing });

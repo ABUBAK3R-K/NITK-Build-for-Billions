@@ -63,6 +63,7 @@ jobs:
           JWT_REFRESH_SECRET: ${{ secrets.JWT_REFRESH_SECRET }}
           ADMIN_SEED_SECRET: ${{ secrets.ADMIN_SEED_SECRET }}
           DEMO_PHONE_NUMBERS: ${{ secrets.DEMO_PHONE_NUMBERS }}
+          CREDENTIAL_SIGNING_KEY: ${{ secrets.CREDENTIAL_SIGNING_KEY }}
           PORTAL_URL: ${{ vars.PORTAL_URL }}
           LLM_MODEL: ${{ vars.LLM_MODEL }}
         run: |
@@ -76,6 +77,7 @@ jobs:
               "CertificateThreshold=3" \
               "PortalUrl=$PORTAL_URL" \
               "DemoPhoneNumbers=$DEMO_PHONE_NUMBERS" \
+              "CredentialSigningKey=$CREDENTIAL_SIGNING_KEY" \
               "WhatsAppApiToken=$WHATSAPP_API_TOKEN" \
               "WhatsAppPhoneNumberId=$WHATSAPP_PHONE_NUMBER_ID" \
               "WhatsAppVerifyToken=$WHATSAPP_VERIFY_TOKEN" \

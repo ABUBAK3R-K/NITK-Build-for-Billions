@@ -1,6 +1,7 @@
 import { test, after, before } from 'node:test';
 import assert from 'node:assert/strict';
 import jwt from 'jsonwebtoken';
+import bcrypt from 'bcryptjs';
 import * as H from './helpers/harness.mjs';
 import { installDdbExtras } from './helpers/admin-extras.mjs';
 
@@ -38,16 +39,25 @@ test('seed is a one-time bootstrap: concurrent seeds create one admin, later see
 });
 
 test('login for an unknown email still pays a bcrypt compare', async () => {
+  // Assert on the work done, not wall-clock time (timing is noisy when test files run in parallel)
   const admin = [...H.table('AdminUsers').values()].find((a) => a.email);
-  const time = async (email) => {
-    const t0 = performance.now();
-    const r = await callApi('POST', '/api/auth/login', { body: { email, password: 'wrong-password' } });
-    assert.equal(r.status, 401);
-    return performance.now() - t0;
+  const realCompare = bcrypt.compare;
+  const hashes = [];
+  bcrypt.compare = (password, hash) => {
+    hashes.push(hash);
+    return realCompare.call(bcrypt, password, hash);
   };
-  const known = await time(admin.email);
-  const unknown = await time('nobody@example.com');
-  assert.ok(unknown > known * 0.5, `unknown ${unknown}ms vs known ${known}ms`);
+  try {
+    for (const email of [admin.email, 'nobody@example.com']) {
+      const r = await callApi('POST', '/api/auth/login', { body: { email, password: 'wrong-password' } });
+      assert.equal(r.status, 401);
+    }
+  } finally {
+    bcrypt.compare = realCompare;
+  }
+  assert.equal(hashes.length, 2, 'both logins run a bcrypt compare');
+  const cost = (hash) => bcrypt.getRounds(hash);
+  assert.equal(cost(hashes[1]), cost(hashes[0]), 'the dummy hash has the same cost as a real one');
 });
 
 test('bad input is a generic 400; 500s carry no internal message; missing JWT secret is "Server misconfigured"', async () => {

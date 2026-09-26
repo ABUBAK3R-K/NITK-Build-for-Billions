@@ -141,6 +141,37 @@ export async function sendDocumentMessage(phoneNumber, docUrl, filename, caption
 }
 
 /**
+ * Send a template message via WhatsApp
+ * @param {string} phoneNumber
+ * @param {string} templateName
+ * @param {string} languageCode
+ */
+export async function sendTemplateMessage(phoneNumber, templateName, languageCode = 'en') {
+  const payload = {
+    messaging_product: 'whatsapp',
+    to: phoneNumber,
+    type: 'template',
+    template: {
+      name: templateName,
+      language: { code: languageCode },
+    },
+  };
+
+  if (isDemoMode() || noWhatsAppToken()) {
+    console.log(`[WhatsApp STUB] Template → ${phoneNumber}: ${templateName} (${languageCode})`);
+    return { success: true, demo: true, messageId: `demo-${Date.now()}` };
+  }
+
+  try {
+    const response = await axios.post(apiUrl(), payload, { headers: headers() });
+    return { success: true, messageId: response.data.messages?.[0]?.id };
+  } catch (err) {
+    console.error('[WhatsApp] sendTemplateMessage failed:', err.response?.status, JSON.stringify(err.response?.data));
+    throw err;
+  }
+}
+
+/**
  * Send a location request message via WhatsApp
  * Shows a "Send Location" button — worker just taps it, no typing needed.
  * @param {string} phoneNumber
@@ -173,6 +204,66 @@ export async function sendLocationRequest(phoneNumber, text) {
   }
 }
 
+/** Post an interactive message (list or reply buttons); logs instead of sending in demo mode */
+async function sendInteractive(phoneNumber, interactive, label) {
+  const payload = {
+    messaging_product: 'whatsapp',
+    recipient_type: 'individual',
+    to: phoneNumber,
+    type: 'interactive',
+    interactive,
+  };
+
+  if (isDemoMode() || noWhatsAppToken()) {
+    console.log(`[WhatsApp STUB] ${label} → ${phoneNumber}: ${interactive.body?.text}`);
+    return { success: true, demo: true, messageId: `demo-${Date.now()}` };
+  }
+
+  try {
+    const response = await axios.post(apiUrl(), payload, { headers: headers() });
+    return { success: true, messageId: response.data.messages?.[0]?.id };
+  } catch (err) {
+    console.error(`[WhatsApp] ${label} failed:`, err.response?.status, JSON.stringify(err.response?.data));
+    throw err;
+  }
+}
+
+/**
+ * Send a tap-able list menu. The worker's choice comes back as a list_reply whose id is the
+ * row id, so routing does not depend on the (translated) row title.
+ * @param {string} phoneNumber
+ * @param {object} menu
+ * @param {string} menu.body - Message text (max 1024 chars)
+ * @param {string} menu.button - Label of the button that opens the list (max 20 chars)
+ * @param {Array<{id: string, title: string, description?: string}>} menu.rows - Up to 10 rows (title max 24 chars)
+ */
+export async function sendListMenu(phoneNumber, { body, button, rows }) {
+  return sendInteractive(phoneNumber, {
+    type: 'list',
+    body: { text: body },
+    action: {
+      button,
+      sections: [{ title: 'Nirman Mitra', rows: rows.slice(0, 10) }],
+    },
+  }, 'sendListMenu');
+}
+
+/**
+ * Send up to three reply buttons. The choice comes back as a button_reply with the button id.
+ * @param {string} phoneNumber
+ * @param {string} body - Message text
+ * @param {Array<{id: string, title: string}>} buttons - Max 3, title max 20 chars
+ */
+export async function sendReplyButtons(phoneNumber, body, buttons) {
+  return sendInteractive(phoneNumber, {
+    type: 'button',
+    body: { text: body },
+    action: {
+      buttons: buttons.slice(0, 3).map((b) => ({ type: 'reply', reply: { id: b.id, title: b.title } })),
+    },
+  }, 'sendReplyButtons');
+}
+
 /**
  * Download media from WhatsApp by media ID
  * Used when workers send images/audio — fetch the binary content.
@@ -182,9 +273,9 @@ export async function sendLocationRequest(phoneNumber, text) {
 export async function downloadMedia(mediaId) {
   if (isDemoMode() || noWhatsAppToken()) {
     console.log(`[WhatsApp STUB] Download media: ${mediaId}`);
-    // Return a tiny placeholder buffer in demo mode
+    // Return a unique placeholder buffer in demo mode based on mediaId
     return {
-      buffer: Buffer.from('demo-media-placeholder'),
+      buffer: Buffer.from(`demo-media-placeholder-${mediaId}`),
       contentType: 'application/octet-stream',
     };
   }
@@ -266,6 +357,7 @@ function parseMessage(message, contact) {
       timestamp: message.timestamp,
       type: message.type, // text, image, audio, location, document
       contactName: contact?.profile?.name || 'Unknown',
+      isForwarded: message.context?.forwarded || false,
     };
 
     // Extract type-specific content
@@ -286,6 +378,8 @@ function parseMessage(message, contact) {
       case 'location':
         parsed.latitude = message.location?.latitude;
         parsed.longitude = message.location?.longitude;
+        parsed.locationName = message.location?.name;
+        parsed.locationAddress = message.location?.address;
         break;
       case 'document':
         parsed.mediaId = message.document?.id;
@@ -326,7 +420,9 @@ export default {
   sendAudioMessage,
   sendImageMessage,
   sendDocumentMessage,
+  sendTemplateMessage,
   sendLocationRequest,
+  sendReplyButtons,
   downloadMedia,
   validateMetaSignature,
   parseWebhookMessage,

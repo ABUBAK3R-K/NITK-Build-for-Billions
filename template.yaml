@@ -28,6 +28,12 @@ Parameters:
     Default: ''
     Description: Optional email address for Lambda error alarms (leave empty for no notifications)
 
+  CredentialSigningKey:
+    Type: String
+    Default: ''
+    NoEcho: true
+    Description: Issuer ES256 private key (JWK, base64-encoded) used to sign work credentials
+
   DemoPhoneNumbers:
     Type: String
     Default: ''
@@ -103,6 +109,7 @@ Globals:
         ENVIRONMENT: !Ref Environment
         CERTIFICATE_THRESHOLD: !Ref CertificateThreshold
         DEMO_PHONE_NUMBERS: !Ref DemoPhoneNumbers
+        CREDENTIAL_SIGNING_JWK: !Ref CredentialSigningKey
         PORTAL_URL: !Ref PortalUrl
         WORKERS_TABLE: !Ref WorkersTable
         ATTENDANCE_TABLE: !Ref AttendanceLogsTable
@@ -124,6 +131,7 @@ Globals:
         ADMIN_SEED_SECRET: !Ref AdminSeedSecret
         ADMIN_USERS_TABLE: !Ref AdminUsersTable
         REFRESH_TOKENS_TABLE: !Ref RefreshTokensTable
+        AUDIT_TABLE: !Ref AuditLogTable
         REKOGNITION_COLLECTION_ID: nirman-mitra-workers
         BEDROCK_CACHE_TABLE: !Ref BedrockCacheTable
         LLM_PROVIDER: groq
@@ -217,6 +225,10 @@ Resources:
           AttributeType: S
         - AttributeName: phone_number
           AttributeType: S
+        - AttributeName: profile_status
+          AttributeType: S
+        - AttributeName: next_reminder_time
+          AttributeType: S
       KeySchema:
         - AttributeName: worker_id
           KeyType: HASH
@@ -225,6 +237,14 @@ Resources:
           KeySchema:
             - AttributeName: phone_number
               KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+        - IndexName: ReminderIndex
+          KeySchema:
+            - AttributeName: profile_status
+              KeyType: HASH
+            - AttributeName: next_reminder_time
+              KeyType: RANGE
           Projection:
             ProjectionType: ALL
       StreamSpecification:
@@ -326,6 +346,33 @@ Resources:
               KeyType: HASH
           Projection:
             ProjectionType: ALL
+        - IndexName: CertificateIdIndex
+          KeySchema:
+            - AttributeName: certificate_id
+              KeyType: HASH
+          Projection:
+            ProjectionType: KEYS_ONLY
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  # Append-only: functions get PutItem/GetItem/Query on it, never UpdateItem or DeleteItem
+  AuditLogTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub 'NirmanMitra-AuditLog-${Environment}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: subject
+          AttributeType: S
+        - AttributeName: entry_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: subject
+          KeyType: HASH
+        - AttributeName: entry_id
+          KeyType: RANGE
       PointInTimeRecoverySpecification:
         PointInTimeRecoveryEnabled: true
 
@@ -551,6 +598,10 @@ Resources:
             - Effect: Allow
               Action: [transcribe:StartTranscriptionJob, transcribe:GetTranscriptionJob]
               Resource: '*'
+        - Statement:
+            - Effect: Allow
+              Action: [dynamodb:PutItem, dynamodb:GetItem, dynamodb:Query]
+              Resource: !GetAtt AuditLogTable.Arn
 
   AttendanceProcessorFunction:
     Type: AWS::Serverless::Function
@@ -751,6 +802,60 @@ Resources:
             RestApiId: !Ref NirmanMitraApi
             Path: /api/admin/sites
             Method: POST
+        OfficerView:
+          Type: Api
+          Properties:
+            RestApiId: !Ref NirmanMitraApi
+            Path: /api/officer/view
+            Method: POST
+        OfficerDecision:
+          Type: Api
+          Properties:
+            RestApiId: !Ref NirmanMitraApi
+            Path: /api/officer/approve
+            Method: POST
+        CredentialAudit:
+          Type: Api
+          Properties:
+            RestApiId: !Ref NirmanMitraApi
+            Path: /api/officer/credential/{jti}/audit
+            Method: GET
+        ListCompanies:
+          Type: Api
+          Properties:
+            RestApiId: !Ref NirmanMitraApi
+            Path: /api/admin/companies
+            Method: GET
+        CreateCompany:
+          Type: Api
+          Properties:
+            RestApiId: !Ref NirmanMitraApi
+            Path: /api/admin/companies
+            Method: POST
+        CompanyOverview:
+          Type: Api
+          Properties:
+            RestApiId: !Ref NirmanMitraApi
+            Path: /api/company/overview
+            Method: GET
+        CompanyRoster:
+          Type: Api
+          Properties:
+            RestApiId: !Ref NirmanMitraApi
+            Path: /api/company/roster
+            Method: GET
+        CompanyFlags:
+          Type: Api
+          Properties:
+            RestApiId: !Ref NirmanMitraApi
+            Path: /api/company/flags
+            Method: GET
+        CompanyMusterRoll:
+          Type: Api
+          Properties:
+            RestApiId: !Ref NirmanMitraApi
+            Path: /api/company/muster.csv
+            Method: GET
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref WorkersTable
@@ -766,6 +871,36 @@ Resources:
             TableName: !Ref AdminUsersTable
         - DynamoDBCrudPolicy:
             TableName: !Ref RefreshTokensTable
+        - Statement:
+            - Effect: Allow
+              Action: [dynamodb:PutItem, dynamodb:GetItem, dynamodb:Query]
+              Resource: !GetAtt AuditLogTable.Arn
+
+  ProactiveReminderFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'nirman-mitra-proactive-reminder-${Environment}'
+      Handler: src/handlers/proactiveReminder.handler
+      Description: Sends WhatsApp reminders to workers who missed check-ins
+      Timeout: 60
+      Events:
+        ScheduleTimer:
+          Type: Schedule
+          Properties:
+            Schedule: rate(15 minutes)
+            Name: !Sub 'nirman-mitra-reminder-schedule-${Environment}'
+            Description: Run every 15 minutes to check for pending reminders
+            Enabled: true
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref WorkersTable
+        - Statement:
+            - Effect: Allow
+              Action: [dynamodb:Query]
+              Resource: !Sub '${WorkersTable.Arn}/index/ReminderIndex'
+      Environment:
+        Variables:
+          WHATSAPP_REMINDER_TEMPLATE_NAME: 'daily_checkin_reminder'
 
   # ─────────────────────────────────────────────────────────
   # STEP FUNCTIONS

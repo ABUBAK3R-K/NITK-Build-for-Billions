@@ -78,7 +78,9 @@ const mockDb = {
           ? { token_id: item.token_id }
           : item.site_id !== undefined
             ? { site_id: item.site_id }
-            : { _id: JSON.stringify(item) });
+            : item.subject !== undefined
+              ? { subject: item.subject, entry_id: item.entry_id }
+              : { _id: JSON.stringify(item) });
     if (conditionExpression && !mockConditionHolds(store.get(key), conditionExpression, expressionValues, expressionNames)) {
       throw conditionalCheckFailed();
     }
@@ -392,6 +394,26 @@ export async function incrementDaysLogged(workerId) {
   );
 }
 
+/** Update worker reminder state after a check-in */
+export async function updateWorkerReminderState(workerId, lastCheckinDate, nextReminderTime) {
+  return updateItem(
+    config.tables.workers,
+    { worker_id: workerId },
+    'SET last_checkin_date = :ld, next_reminder_time = :nt',
+    { ':ld': lastCheckinDate, ':nt': nextReminderTime },
+  );
+}
+
+/** Update only the next reminder time (used by the cron job) */
+export async function updateWorkerReminderTime(workerId, nextReminderTime) {
+  return updateItem(
+    config.tables.workers,
+    { worker_id: workerId },
+    'SET next_reminder_time = :nt',
+    { ':nt': nextReminderTime },
+  );
+}
+
 export default {
   putItem,
   getItem,
@@ -406,4 +428,6 @@ export default {
   getWorkerAttendanceLogs,
   getPendingReviews,
   incrementDaysLogged,
+  updateWorkerReminderState,
+  updateWorkerReminderTime,
 };

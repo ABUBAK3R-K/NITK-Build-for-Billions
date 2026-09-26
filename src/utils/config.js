@@ -23,6 +23,11 @@ const config = Object.freeze({
   // Public URL of the dashboard / officer portal (no trailing slash); certificate QR codes link here
   portalUrl: (process.env.PORTAL_URL || '').replace(/\/+$/, ''),
 
+  // Signed work credentials: issuer's ES256 private key as a JWK (JSON string)
+  credential: {
+    signingJwk: process.env.CREDENTIAL_SIGNING_JWK || '',
+  },
+
   // Team phone numbers (digits only, comma-separated) allowed to use the "demo cert" /
   // "test review" keywords. Empty means nobody can.
   demoPhoneNumbers: (process.env.DEMO_PHONE_NUMBERS || '')
@@ -52,7 +57,11 @@ const config = Object.freeze({
     bedrockCache: process.env.BEDROCK_CACHE_TABLE || 'NirmanMitra-BedrockCache-dev',
     adminUsers: process.env.ADMIN_USERS_TABLE || 'NirmanMitra-AdminUsers-dev',
     refreshTokens: process.env.REFRESH_TOKENS_TABLE || 'NirmanMitra-RefreshTokens-dev',
+    audit: process.env.AUDIT_TABLE || 'NirmanMitra-AuditLog-dev',
   },
+
+  // Version of the WhatsApp purpose notice a worker agrees to; bump it when the notice text changes
+  consentNoticeVersion: '2026-09-27',
 
   // S3 Buckets
   buckets: {

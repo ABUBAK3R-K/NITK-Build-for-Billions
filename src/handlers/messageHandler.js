@@ -10,6 +10,7 @@
  * 3. Active worker → Attendance check-in (Triple Verification) / progress queries
  */
 
+import crypto from 'crypto';
 import { LexRuntimeV2Client, RecognizeTextCommand } from '@aws-sdk/client-lex-runtime-v2';
 import { LambdaClient, InvokeCommand } from '@aws-sdk/client-lambda';
 import config, { apiResponse, isDemoMode, istDate } from '../utils/config.js';
@@ -19,6 +20,8 @@ import {
   saveConversationState,
   updateItem,
   queryItems,
+  getItem,
+  getWorkerAttendanceLogs,
 } from '../utils/dynamodb.js';
 import {
   parseWebhookMessages,
@@ -27,10 +30,21 @@ import {
   sendTextMessage,
   sendAudioMessage,
   sendDocumentMessage,
+  sendImageMessage,
   sendLocationRequest,
+  sendListMenu,
+  sendReplyButtons,
 } from '../utils/whatsapp.js';
 import { uploadWorkerMedia, generatePresignedUrl } from '../utils/s3.js';
 import { putItemIfAbsent } from '../services/conditionalWrite.js';
+import {
+  hasConsent,
+  isConsentReply,
+  sendConsentNotice,
+  consentRequiredText,
+  consentThanksText,
+  recordConsent,
+} from '../services/consent.js';
 import {
   handleGreeting,
   handleNameCapture,
@@ -208,6 +222,42 @@ async function handleIncomingMessage(message) {
 
   // Look up worker by phone number
   const existingWorker = await getWorkerByPhone(phoneNumber);
+  const language = existingWorker?.preferred_language || 'hi';
+
+  // --- ANTI-FRAUD CHECKS (Phase 1) ---
+  if (message.isForwarded) {
+    console.warn(`[Anti-Fraud] Blocked forwarded message from ${phoneNumber}`);
+    const text = t(language, {
+      en: 'Please record a new photo/voice note directly in this chat. Forwarded messages are not accepted.',
+      hi: 'Kripya is chat mein seedhe naya photo ya voice note record karein. Forward kiye gaye message manya nahi hain.',
+      kn: KN.antiFraudForwarded || 'ದಯವಿಟ್ಟು ಹೊಸ ಫೋಟೋ/ವಾಯ್ಸ್ ನೋಟ್ ಕಳುಹಿಸಿ. ಫಾರ್ವರ್ಡ್ ಮಾಡಿದ ಸಂದೇಶಗಳನ್ನು ಸ್ವೀಕರಿಸಲಾಗುವುದಿಲ್ಲ.',
+    });
+    await sendTextMessage(phoneNumber, text);
+    return apiResponse(200, { status: 'rejected_forwarded' });
+  }
+
+  if (message.type === 'location' && (message.locationName || message.locationAddress)) {
+    console.warn(`[Anti-Fraud] Blocked dropped pin from ${phoneNumber}`);
+    const text = t(language, {
+      en: 'Please share your live "Current Location", not a dropped pin.',
+      hi: 'Kripya apna live "Current Location" share karein, dropped pin nahi.',
+      kn: KN.antiFraudDroppedPin || 'ದಯವಿಟ್ಟು ನಿಮ್ಮ ಲೈವ್ "ಕರೆಂಟ್ ಲೊಕೇಶನ್" ಶೇರ್ ಮಾಡಿ.',
+    });
+    await sendTextMessage(phoneNumber, text);
+    return apiResponse(200, { status: 'rejected_dropped_pin' });
+  }
+
+  if (message.type === 'audio' && !message.isVoiceNote) {
+    console.warn(`[Anti-Fraud] Blocked audio file upload from ${phoneNumber}`);
+    const text = t(language, {
+      en: 'Please hold the microphone button to record a voice note. Audio file uploads are not accepted.',
+      hi: 'Kripya voice note record karne ke liye mic button dabakar rakhein. Audio file accept nahi hoti.',
+      kn: KN.antiFraudAudioFile || 'ದಯವಿಟ್ಟು ಮೈಕ್ರೊಫೋನ್ ಬಟನ್ ಹಿಡಿದು ವಾಯ್ಸ್ ನೋಟ್ ರೆಕಾರ್ಡ್ ಮಾಡಿ.',
+    });
+    await sendTextMessage(phoneNumber, text);
+    return apiResponse(200, { status: 'rejected_audio_file' });
+  }
+  // -----------------------------------
 
   if (!existingWorker) {
     // New worker — start registration
@@ -218,7 +268,15 @@ async function handleIncomingMessage(message) {
   const { profile_status, worker_id: workerId } = existingWorker;
 
   // "English" / "Hindi" / "ಕನ್ನಡ" switches language at any step
-  const switchTo = message.type === 'text' ? parseLanguageSwitch(message.text) : null;
+  const switchTo = message.type === 'text'
+    ? LANGUAGE_BUTTONS[message.buttonId] || parseLanguageSwitch(message.text)
+    : null;
+
+  // No documents, images or voice are collected until the worker agrees to the purpose notice
+  if (!hasConsent(existingWorker)) {
+    return await handleConsentGate(existingWorker, message, switchTo);
+  }
+
   if (switchTo) {
     return await handleLanguageSwitch(workerId, existingWorker, message, switchTo);
   }
@@ -242,7 +300,13 @@ async function handleIncomingMessage(message) {
 async function handleNewWorker(phoneNumber, message) {
   const textContent = message.text || message.caption || '';
 
-  const result = await handleGreeting(phoneNumber, textContent);
+  // Only the phone number and detected language are stored; the purpose notice comes first
+  const result = await handleGreeting(phoneNumber, textContent, { awaitConsent: true });
+
+  if (!result.isExisting) {
+    await sendConsentNotice(phoneNumber, result.language);
+    return apiResponse(200, { status: 'consent_requested', workerId: result.workerId });
+  }
 
   // Send response via WhatsApp
   await sendTextMessage(phoneNumber, result.responseText);
@@ -255,6 +319,59 @@ async function handleNewWorker(phoneNumber, message) {
     workerId: result.workerId,
     isExisting: result.isExisting,
   });
+}
+
+// ─────────────────────────────────────────────────────────
+// Consent gate (PRD FR-1): nothing is collected before "I agree"
+// ─────────────────────────────────────────────────────────
+
+async function handleConsentGate(worker, message, switchTo) {
+  const phoneNumber = message.from;
+  const workerId = worker.worker_id;
+  let language = worker.preferred_language || 'hi';
+
+  if (switchTo && switchTo !== language) {
+    language = switchTo;
+    await updateItem(
+      config.tables.workers,
+      { worker_id: workerId },
+      'SET preferred_language = :lang, updated_at = :ts',
+      { ':lang': language, ':ts': new Date().toISOString() },
+    );
+  }
+
+  if (!switchTo && isConsentReply(message)) {
+    await recordConsent(workerId, language);
+    await sendTextMessage(phoneNumber, consentThanksText(language));
+
+    // Continue where the worker is: a new worker starts registration with the name step
+    if (worker.profile_status === 'onboarding') {
+      const state = await getConversationState(workerId);
+      const step = !state?.current_step || state.current_step === 'awaiting_consent' ? 'awaiting_name' : state.current_step;
+      await saveConversationState(workerId, workerId, {
+        ...(state || {}),
+        current_step: step,
+        preferred_language: language,
+        retry_count: state?.retry_count || 0,
+      });
+      const next = step === 'awaiting_name' ? getGreetingMessage(language) : onboardingStepReminder(step, language);
+      if (next) await sendTextAndVoice(phoneNumber, workerId, next, language, 'consent-next');
+    } else {
+      await sendTextMessage(phoneNumber, t(language, {
+        en: 'You can continue: send a selfie to log today\'s attendance.',
+        hi: 'Ab aap aage badh sakte hain: aaj ki attendance ke liye selfie bhejiye.',
+        kn: KN.consentContinueActive,
+      }));
+    }
+    return apiResponse(200, { status: 'consent_recorded', workerId });
+  }
+
+  // Anything else (a photo, a voice note, text) is not stored: explain, then show the notice
+  if (!switchTo && message.type !== 'text') {
+    await sendTextMessage(phoneNumber, consentRequiredText(language));
+  }
+  await sendConsentNotice(phoneNumber, language);
+  return apiResponse(200, { status: 'consent_requested', workerId });
 }
 
 // ─────────────────────────────────────────────────────────
@@ -596,6 +713,10 @@ async function handleActiveWorker(workerId, worker, message) {
 
   // Text messages — check if we're in attendance flow first
   if (message.type === 'text') {
+    // Menu and language taps are commands, never the answer to a check-in step
+    if (message.buttonId && BUTTON_INTENTS[message.buttonId]) {
+      return await handleActiveWorkerText(workerId, worker, message);
+    }
     // If awaiting voice, "ok"/"done"/"skip"/any short text skips voice and processes attendance
     if (attendanceStep === 'awaiting_voice' && state?.pending_selfie_key) {
       const lower = (message.text || '').toLowerCase().trim();
@@ -640,17 +761,20 @@ async function handleActiveWorker(workerId, worker, message) {
   if (message.type === 'location') {
     // Accept location if we have a pending selfie (in awaiting_location OR awaiting_voice state)
     if (state?.pending_selfie_key && (attendanceStep === 'awaiting_location' || attendanceStep === 'awaiting_voice')) {
+      const passcode = Math.floor(Math.random() * 90) + 10; // 10 to 99
+      
       // Store location, move to voice step
       await saveConversationState(workerId, workerId, {
         ...state,
         current_step: 'awaiting_voice',
         pending_latitude: message.latitude,
         pending_longitude: message.longitude,
+        passcode: passcode,
       });
       const voiceText = t(language, {
-        en: 'Location received! Now hold the mic button and tell us:\n• What work did you do today?\n• Which floor or area?\n\nExample: "Today I did painting work on 3rd floor"\n\nOr send "ok" to skip.',
-        hi: 'Location mil gaya! Ab mic button dabake bataiye:\n• Aaj kya kaam kiya?\n• Kaun si jagah pe?\n\nJaise: "Aaj maine 3rd floor pe painting ka kaam kiya"\n\nYa "ok" bhejiye skip karne ke liye.',
-        kn: KN.voiceAskAfterLocation,
+        en: `Location received! Now hold the mic button and tell us:\n• What work did you do today?\n• Which floor or area?\n• Please say the number "${passcode}"\n\nExample: "Today I did painting on 3rd floor, ${passcode}"\n\nOr send "ok" to skip.`,
+        hi: `Location mil gaya! Ab mic button dabake bataiye:\n• Aaj kya kaam kiya?\n• Kaun si jagah pe?\n• Kripya number "${passcode}" boliye\n\nJaise: "Aaj maine 3rd floor pe painting ka kaam kiya, ${passcode}"\n\nYa "ok" bhejiye skip karne ke liye.`,
+        kn: `ಸ್ಥಳ ಸ್ವೀಕರಿಸಲಾಗಿದೆ! ಈಗ ಮೈಕ್ ಬಟನ್ ಒತ್ತಿ ಹಿಡಿದು ಹೇಳಿ:\n• ಇಂದು ನೀವು ಯಾವ ಕೆಲಸ ಮಾಡಿದ್ದೀರಿ?\n• ಯಾವ ಮಹಡಿ ಅಥವಾ ಪ್ರದೇಶ?\n• ದಯವಿಟ್ಟು "${passcode}" ಸಂಖ್ಯೆಯನ್ನು ಹೇಳಿ\n\nಉದಾಹರಣೆಗೆ: "ಇಂದು ನಾನು 3ನೇ ಮಹಡಿಯಲ್ಲಿ ಪೇಂಟಿಂಗ್ ಮಾಡಿದ್ದೇನೆ, ${passcode}"\n\nಅಥವಾ ಸ್ಕಿಪ್ ಮಾಡಲು "ok" ಕಳುಹಿಸಿ.`,
       });
       await sendTextMessage(phoneNumber, voiceText);
       return apiResponse(200, { status: 'location_stored_awaiting_voice', workerId });
@@ -699,6 +823,12 @@ async function handleActiveWorkerText(workerId, worker, message) {
   const phoneNumber = message.from;
   const language = worker.preferred_language || 'hi';
   const text = (message.text || '').trim();
+
+  // A tapped menu row or button carries its id; route by id so translated titles never matter
+  const tapped = message.buttonId && BUTTON_INTENTS[message.buttonId];
+  if (tapped) {
+    return await executeIntent({ ...tapped, confidence: 100, source: 'button', transcript: text }, workerId, worker, phoneNumber, language);
+  }
 
   // Detect intent and execute
   const intent = await detectIntent(text, language);
@@ -770,7 +900,24 @@ const LEX_INTENT_MAP = {
   FallbackIntent: null, // Lex doesn't know → go to the LLM
 };
 
-const LLM_INTENTS = new Set(['check_progress', 'request_certificate', 'log_attendance', 'help', 'greeting']);
+const LLM_INTENTS = new Set([
+  'check_progress', 'request_certificate', 'log_attendance', 'help', 'greeting',
+  'today_status', 'my_days', 'change_language', 'menu',
+]);
+
+// Self-service menu rows and language buttons: id → intent
+const BUTTON_INTENTS = {
+  menu_today: { type: 'today_status' },
+  menu_days: { type: 'my_days' },
+  menu_progress: { type: 'check_progress' },
+  menu_card: { type: 'request_certificate' },
+  menu_checkin: { type: 'log_attendance' },
+  menu_language: { type: 'change_language' },
+  menu_help: { type: 'help' },
+};
+
+// Language picker buttons → language code (handled by the any-step language switch)
+const LANGUAGE_BUTTONS = { lang_kn: 'kn', lang_hi: 'hi', lang_en: 'en' };
 const DEMO_INTENTS = new Set(['demo_fail', 'demo_certificate']);
 
 function isDemoPhone(phoneNumber) {
@@ -780,7 +927,11 @@ function isDemoPhone(phoneNumber) {
 
 // Checked in order: certificate before progress, as for the romanized keywords
 const KANNADA_INTENT_KEYWORDS = [
-  ['request_certificate', /ಸರ್ಟಿಫಿಕೇಟ್|ಪ್ರಮಾಣ ?ಪತ್ರ/u],
+  ['menu', /^ಮೆನು$/u],
+  ['today_status', /ಇಂದಿನ ಹಾಜರಿ|^ಇಂದು$|^ಇವತ್ತು$/u],
+  ['my_days', /ನನ್ನ ದಿನ/u],
+  ['change_language', /ಭಾಷೆ/u],
+  ['request_certificate', /ಸರ್ಟಿಫಿಕೇಟ್|ಪ್ರಮಾಣ ?ಪತ್ರ|ಕಾರ್ಡ್/u],
   ['check_progress', /ಪ್ರಗತಿ|ಪ್ರೋಗ್ರೆಸ್|ಎಷ್ಟು ದಿನ|ಸ್ಟೇಟಸ್/u],
   ['log_attendance', /ಹಾಜರಿ|ಸೆಲ್ಫಿ/u],
   ['help', /ಸಹಾಯ|ಹೆಲ್ಪ್/u],
@@ -799,8 +950,23 @@ async function detectIntent(text, language) {
     return { type: 'demo_certificate', confidence: 99, source: 'keyword', transcript: text };
   }
 
+  // Self-service commands (short phrases, so work descriptions like "aaj maine plaster kiya" don't match)
+  const phrase = lower.replace(/[?!.]+$/, '').trim();
+  if (/^(menu|options|मेनू)$/.test(phrase)) {
+    return { type: 'menu', confidence: 99, source: 'keyword', transcript: text };
+  }
+  if (/^(aaj|today|aaj ki haziri|aaj ka status|today status|aaj haziri|आज|आज की हाज़िरी|आज की हाजिरी)$/.test(phrase)) {
+    return { type: 'today_status', confidence: 95, source: 'keyword', transcript: text };
+  }
+  if (/\b(mere din|my days|history|din dikhao|mera record|my record|meri haziri)\b|मेरे दिन/.test(lower)) {
+    return { type: 'my_days', confidence: 95, source: 'keyword', transcript: text };
+  }
+  if (/\b(language|bhasha|bhaasha)\b|भाषा/.test(lower)) {
+    return { type: 'change_language', confidence: 95, source: 'keyword', transcript: text };
+  }
+
   // Certificate before progress: "certificate status" / "certificate kab milega" is about the certificate
-  if (/\b(certificate|praman|patra|download|sanad)\b/.test(lower)) {
+  if (/\b(certificate|praman|patra|download|sanad|card)\b/.test(lower)) {
     return { type: 'request_certificate', confidence: 95, source: 'keyword', transcript: text };
   }
   // Only explicit day-count phrases: a bare "din" ("aaj ka din accha tha") is not a progress query
@@ -878,6 +1044,10 @@ Possible intents:
 - log_attendance: Worker wants to mark today's attendance
 - help: Worker is confused, asking what they can do, or needs guidance
 - greeting: Worker is just saying hello
+- today_status: Worker asks whether today's attendance is done or verified
+- my_days: Worker wants to see the list or history of days they worked
+- change_language: Worker wants replies in a different language
+- menu: Worker wants to see the options or menu
 - other: Anything else (describe briefly)
 
 Respond in EXACTLY this JSON format (no markdown):
@@ -1021,6 +1191,9 @@ async function executeIntent(intent, workerId, worker, phoneNumber, language) {
       const existingCert = await findLatestCertificate(workerId);
       if (existingCert) {
         await sendCertificateDocument(phoneNumber, existingCert, language);
+        if (existingCert.credential_jwt && existingCert.qr_s3_key) {
+          await sendCredentialQr(phoneNumber, existingCert.qr_s3_key, language);
+        }
         return apiResponse(200, { status: 'certificate_resent', workerId, intent: intent.type });
       }
       if (daysLogged < threshold) {
@@ -1057,6 +1230,91 @@ async function executeIntent(intent, workerId, worker, phoneNumber, language) {
       return apiResponse(200, { status: 'greeting_sent', workerId, intent: intent.type });
     }
 
+    case 'menu': {
+      await sendSelfServiceMenu(phoneNumber, language);
+      return apiResponse(200, { status: 'menu_sent', workerId, intent: intent.type });
+    }
+
+    case 'today_status': {
+      const log = await getItem(config.tables.attendance, { worker_id: workerId, log_date: istDate() });
+      const status = log?.verification_status;
+      const site = log?.site_name && log.site_name !== 'Unknown Site' ? log.site_name : '';
+      let responseText;
+      if (status === 'auto_approved' || status === 'approved') {
+        responseText = t(language, {
+          en: `Today's attendance is verified ✅${site ? ` (${site})` : ''}`,
+          hi: `Aaj ki haziri verify ho gayi ✅${site ? ` (${site})` : ''}`,
+          kn: KN.todayVerified(site),
+        });
+      } else if (status === 'pending_review') {
+        responseText = t(language, {
+          en: "Today's attendance is under admin review ⏳. We will let you know soon.",
+          hi: 'Aaj ki haziri admin review mein hai ⏳. Jaldi batayenge.',
+          kn: KN.todayPending,
+        });
+      } else if (status === 'rejected') {
+        responseText = t(language, {
+          en: "Today's attendance could not be verified ❌. Please send a selfie again.",
+          hi: 'Aaj ki haziri verify nahi ho saki ❌. Kripya dobara selfie bhejiye.',
+          kn: KN.todayRejected,
+        });
+      } else {
+        responseText = t(language, {
+          en: 'No attendance yet today. Send a selfie to mark it.',
+          hi: 'Aaj abhi haziri nahi lagi. Haziri ke liye selfie bhejiye.',
+          kn: KN.todayNone,
+        });
+      }
+      await sendTextAndVoice(phoneNumber, workerId, responseText, language, 'today-status');
+      return apiResponse(200, { status: 'today_status_sent', workerId, intent: intent.type, attendance: status || 'none' });
+    }
+
+    case 'my_days': {
+      const logs = await getWorkerAttendanceLogs(workerId);
+      const verifiedDays = new Set(
+        logs.filter((l) => l.verification_status === 'auto_approved' || l.verification_status === 'approved').map((l) => l.log_date),
+      ).size;
+      let responseText;
+      if (logs.length === 0) {
+        responseText = t(language, {
+          en: 'No attendance yet. Send a selfie for your first day.',
+          hi: 'Abhi tak koi haziri nahi. Pehle din ke liye selfie bhejiye.',
+          kn: KN.myDaysEmpty,
+        });
+      } else {
+        const icon = { auto_approved: '✅', approved: '✅', pending_review: '⏳', rejected: '❌' };
+        const lines = [...logs]
+          .sort((a, b) => String(b.log_date).localeCompare(String(a.log_date)))
+          .slice(0, 7)
+          .map((l) => {
+            const [, mm, dd] = String(l.log_date).split('-');
+            const site = l.site_name && l.site_name !== 'Unknown Site' ? ` · ${l.site_name}` : '';
+            return `${icon[l.verification_status] || '•'} ${dd}/${mm}${site}`;
+          });
+        const header = t(language, {
+          en: `${verifiedDays} of ${threshold} days verified. Recent attendance:`,
+          hi: `${threshold} mein se ${verifiedDays} din verify hue. Haal ki haziri:`,
+          kn: KN.myDaysHeader(verifiedDays, threshold),
+        });
+        responseText = `${header}\n${lines.join('\n')}`;
+      }
+      await sendTextMessage(phoneNumber, responseText);
+      return apiResponse(200, { status: 'my_days_sent', workerId, intent: intent.type, verifiedDays });
+    }
+
+    case 'change_language': {
+      await sendReplyButtons(phoneNumber, t(language, {
+        en: 'Choose your language:',
+        hi: 'Apni bhasha chuniye:',
+        kn: KN.languagePrompt,
+      }), [
+        { id: 'lang_kn', title: 'ಕನ್ನಡ' },
+        { id: 'lang_hi', title: 'हिन्दी' },
+        { id: 'lang_en', title: 'English' },
+      ]);
+      return apiResponse(200, { status: 'language_prompt_sent', workerId, intent: intent.type });
+    }
+
     case 'help':
     default: {
       const responseText = t(language, {
@@ -1065,6 +1323,7 @@ async function executeIntent(intent, workerId, worker, phoneNumber, language) {
         kn: KN.help(name, daysLogged, daysRemaining),
       });
       await sendTextAndVoice(phoneNumber, workerId, responseText, language, 'help');
+      await sendSelfServiceMenu(phoneNumber, language);
       return apiResponse(200, { status: 'help_sent', workerId, intent: intent.type });
     }
   }
@@ -1099,14 +1358,31 @@ async function handleSelfiePendingLocation(workerId, worker, message, language) 
   const phoneNumber = message.from;
 
   try {
-    // Download and upload selfie to S3
+    // Download media
     const media = await downloadMedia(message.mediaId);
+
+    // ANTI-FRAUD: Duplicate Image Detection (Phase 2)
+    const imageHash = crypto.createHash('sha256').update(media.buffer).digest('hex');
+    const recentAttendance = await queryItems(config.tables.attendance, 'worker_id = :wid', { ':wid': workerId });
+    if (recentAttendance.some(record => record.image_hash === imageHash)) {
+      console.warn(`[Anti-Fraud] Duplicate selfie upload from ${phoneNumber}`);
+      const text = t(language, {
+        en: 'You have already used this photo for a previous check-in. Please take a fresh selfie today.',
+        hi: 'Aapne yeh photo pehle ke attendance ke liye use kiya hai. Kripya aaj ka naya selfie lein.',
+        kn: KN.antiFraudDuplicateSelfie || 'ನೀವು ಈ ಫೋಟೋವನ್ನು ಹಿಂದಿನ ಹಾಜರಾತಿಗೆ ಬಳಸಿದ್ದೀರಿ. ದಯವಿಟ್ಟು ಇಂದಿನ ಹೊಸ ಸೆಲ್ಫಿ ತೆಗೆದುಕೊಳ್ಳಿ.',
+      });
+      await sendTextMessage(phoneNumber, text);
+      return apiResponse(200, { status: 'rejected_duplicate_selfie' });
+    }
+
+    // Upload selfie to S3
     const uploadResult = await uploadWorkerMedia(workerId, 'checkin-selfie', media.buffer, 'image/jpeg');
 
     // Save selfie key in conversation state — wait for location
     await saveConversationState(workerId, workerId, {
       current_step: 'awaiting_location',
       pending_selfie_key: uploadResult.key,
+      pending_selfie_hash: imageHash,
       pending_voice: message.caption || '',
       preferred_language: language,
     });
@@ -1126,8 +1402,10 @@ async function handleSelfiePendingLocation(workerId, worker, message, language) 
       await saveConversationState(workerId, workerId, {
         current_step: 'awaiting_voice',
         pending_selfie_key: uploadResult.key,
+        pending_selfie_hash: imageHash,
         pending_latitude: null,
         pending_longitude: null,
+        passcode: null,
         preferred_language: language,
       });
       const voiceText = t(language, {
@@ -1178,7 +1456,7 @@ async function processFullAttendance(workerId, worker, language, state, voiceTra
     const [faceResult, geoResult, voiceResult] = await Promise.all([
       attendanceHandler({ task: 'face_verify', workerId, selfieKey, bucket: config.buckets.mediaRaw }),
       attendanceHandler({ task: 'geo_verify', workerId, latitude, longitude }),
-      attendanceHandler({ task: 'voice_verify', workerId, voiceTranscription: voice, language }),
+      attendanceHandler({ task: 'voice_verify', workerId, voiceTranscription: voice, language, passcode: state.passcode || null }),
     ]);
 
     const decision = await attendanceHandler({
@@ -1187,6 +1465,7 @@ async function processFullAttendance(workerId, worker, language, state, voiceTra
       faceResult,
       geoResult,
       voiceResult,
+      imageHash: state.pending_selfie_hash || null,
       language,
     });
 
@@ -1278,6 +1557,9 @@ async function triggerCertificateGeneration(workerId, phoneNumber, language) {
         bocw_reference: result.bocwReference,
         pdf_s3_key: result.pdfS3Key,
       }, language);
+      if (result.signedCredential && result.qrS3Key) {
+        await sendCredentialQr(phoneNumber, result.qrS3Key, language);
+      }
     } else {
       console.log(`Certificate not generated for ${workerId}: ${result.reason || result.error}`);
     }
@@ -1285,6 +1567,43 @@ async function triggerCertificateGeneration(workerId, phoneNumber, language) {
     console.error('Certificate generation failed:', err.message);
     // Non-blocking: attendance is already logged, certificate can be retried
   }
+}
+
+/** Tap-able self-service menu; each row id maps to an intent in BUTTON_INTENTS */
+async function sendSelfServiceMenu(phoneNumber, language = 'hi') {
+  const rows = [
+    ['menu_today', "Today's attendance", 'Aaj ki haziri', KN.menuRows.today],
+    ['menu_days', 'My work days', 'Mere din', KN.menuRows.days],
+    ['menu_progress', 'My progress', 'Mera progress', KN.menuRows.progress],
+    ['menu_card', 'My certificate', 'Mera certificate', KN.menuRows.card],
+    ['menu_checkin', 'Mark attendance', 'Haziri lagao', KN.menuRows.checkin],
+    ['menu_language', 'Change language', 'Bhasha badlo', KN.menuRows.language],
+    ['menu_help', 'Help', 'Madad', KN.menuRows.help],
+  ].map(([id, en, hi, kn]) => ({ id, title: t(language, { en, hi, kn }) }));
+  try {
+    await sendListMenu(phoneNumber, {
+      body: t(language, {
+        en: 'What do you need? Tap the button below to choose.',
+        hi: 'Aapko kya chahiye? Neeche button dabakar chuniye.',
+        kn: KN.menuBody,
+      }),
+      button: t(language, { en: 'Options', hi: 'Vikalp', kn: KN.menuButton }),
+      rows,
+    });
+  } catch (err) {
+    console.warn('[Menu] List message failed:', err.message);
+  }
+}
+
+/** Send the signed-credential QR as an image the worker can show a welfare board officer */
+async function sendCredentialQr(phoneNumber, qrS3Key, language = 'hi') {
+  const url = await generatePresignedUrl(config.buckets.certificates, qrS3Key, 900);
+  const caption = t(language, {
+    en: 'Show this QR code to the welfare board officer. They scan it to verify your work days.',
+    hi: 'Yeh QR code welfare board officer ko dikhaiye. Woh ise scan karke aapke kaam ke din verify karenge.',
+    kn: KN.credentialQrCaption,
+  });
+  await sendImageMessage(phoneNumber, url, caption);
 }
 
 /** Most recently issued certificate of a worker, or null */

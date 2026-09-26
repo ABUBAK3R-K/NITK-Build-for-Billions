@@ -10,7 +10,7 @@ const KEYS = {
   Workers: ['worker_id'], AttendanceLogs: ['worker_id', 'log_date'], Sites: ['site_id'],
   Certificates: ['worker_id', 'certificate_id'], Documents: ['worker_id', 'document_id'],
   ConversationState: ['worker_id', 'session_id'], BedrockCache: ['input_hash'],
-  AdminUsers: ['admin_id'], RefreshTokens: ['token_id'],
+  AdminUsers: ['admin_id'], RefreshTokens: ['token_id'], AuditLog: ['subject', 'entry_id'],
 };
 const keysOf = (t) => KEYS[Object.keys(KEYS).find((k) => t.includes(`-${k}-`))];
 const keyStr = (t, item) => { const [pk, sk] = keysOf(t); return JSON.stringify([item[pk], sk ? item[sk] : null]); };

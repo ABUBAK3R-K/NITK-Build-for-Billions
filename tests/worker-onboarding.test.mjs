@@ -11,6 +11,8 @@ const DEFAULT_LINES = [...H.textract.lines];
 const docsFor = (wid) => [...H.table('Documents').values()].filter((d) => d.worker_id === wid);
 const step = (wid) => H.states(wid)[0];
 const AADHAAR_LIKE = /\d{4}[ -]?\d{4}[ -]?\d{4}/;
+// Record ids are random UUIDs, whose digit runs can look like an Aadhaar number by chance
+const withoutUuids = (value) => JSON.stringify(value).replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi, '<uuid>');
 
 before(() => H.quiet());
 afterEach(() => {
@@ -23,6 +25,7 @@ after(() => H.close());
 
 async function toAadhaarStep(phone) {
   await send(phone, M.text('Namaste'));
+  await H.agree(phone);
   await send(phone, M.text('Ram Kumar'));
   return H.worker(phone);
 }
@@ -53,7 +56,7 @@ test('Aadhaar: the card image is not stored and no full number lands in extracte
   assert.equal(H.worker('919300000003').aadhaar_last4, '3450');
   const [doc] = docsFor(w.worker_id);
   assert.equal(doc.extracted_data.address, '12 MG Road, Bengaluru');
-  assert.doesNotMatch(JSON.stringify(doc.extracted_data), AADHAAR_LIKE);
+  assert.doesNotMatch(withoutUuids(doc), AADHAAR_LIKE);
   assert.equal(doc.s3_key, undefined);
   assert.ok(![...H.s3.keys()].some((k) => k.startsWith(`${config.buckets.mediaRaw}/workers/${w.worker_id}/aadhaar`)), 'no Aadhaar image in S3');
 });
@@ -123,10 +126,12 @@ test('selfie: a low-quality face is rejected and deleted', async () => {
 
 test('name: spoken / typed lead-ins are stripped', async () => {
   await send('919300000009', M.text('Namaste'));
+  await H.agree('919300000009');
   await send('919300000009', M.text('mera naam Suresh Kumar hai'));
   assert.equal(H.worker('919300000009').name, 'Suresh Kumar');
 
   await send('919300000010', M.text('Hello'));
+  await H.agree('919300000010');
   await send('919300000010', M.text('My name is Anil'));
   assert.equal(H.worker('919300000010').name, 'Anil');
 });
@@ -134,6 +139,7 @@ test('name: spoken / typed lead-ins are stripped', async () => {
 test('name: a voice note is transcribed under the worker id and cleaned', async () => {
   const phone = '919300000011';
   await send(phone, M.text('Namaste'));
+  await H.agree(phone);
   const wid = H.worker(phone).worker_id;
   H.transcribe.text = 'main Mohan Lal hoon';
   try {
@@ -155,6 +161,7 @@ test('language: namaskar is Hindi, not Bengali', async () => {
 test('language: "English" / "ಕನ್ನಡ" switch language and are not saved as the name', async () => {
   const phone = '919300000013';
   await send(phone, M.text('Namaste'));
+  await H.agree(phone);
   const wid = H.worker(phone).worker_id;
   const r = await send(phone, M.text('English'));
   assert.equal(H.worker(phone).preferred_language, 'en');

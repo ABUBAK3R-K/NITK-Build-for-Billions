@@ -24,12 +24,13 @@ before(async () => {
 after(() => H.close());
 
 async function onboard(phone, greeting) {
-  const first = await send(phone, M.text(greeting));
+  const notice = await send(phone, M.text(greeting));
+  const first = await H.agree(phone);
   await send(phone, M.text('Ram Kumar'));
   await send(phone, M.image('a1'));
   await send(phone, M.image('s1'));
   const last = await send(phone, M.location());
-  return { first, last };
+  return { notice, first, last };
 }
 
 async function checkIn(phone) {
@@ -48,10 +49,10 @@ test('t() falls back to Hindi for a language without a variant', () => {
 test('a worker who writes in Kannada script is greeted and onboarded in Kannada, with no Polly call', async () => {
   const phone = '919500000001';
   const pollyBefore = H.polly.calls.length;
-  const { first, last } = await onboard(phone, 'ನಮಸ್ಕಾರ');
+  const { notice, first, last } = await onboard(phone, 'ನಮಸ್ಕಾರ');
   assert.equal(H.worker(phone).preferred_language, 'kn');
-  assert.equal(first.replies[0], KN.greetingNew);
-  assert.equal(first.replies.length, 1, 'text only: no audio message');
+  assert.deepEqual(notice.replies, [`[buttons] ${KN.consentNotice}`], 'consent notice in Kannada first');
+  assert.deepEqual(first.replies, [KN.consentThanks, KN.greetingNew], 'text only: no audio message');
   assert.ok(last.replies.every((r) => KANNADA.test(r)), `registration replies in Kannada: ${last.replies}`);
   assert.equal(H.worker(phone).profile_status, 'active');
   assert.equal(H.polly.calls.length, pollyBefore, 'no Polly call for Kannada replies');
@@ -68,7 +69,7 @@ test('after switching to Kannada, check-in prompts and the result are in Kannada
 
   const pollyBefore = H.polly.calls.length;
   const { loc, result } = await checkIn(phone);
-  assert.equal(loc.replies[0], KN.voiceAskAfterLocation);
+  assert.match(loc.replies[0], /ಸ್ಥಳ ಸ್ವೀಕರಿಸಲಾಗಿದೆ!/); // Changed to regex because passcode makes it dynamic
   assert.equal(result.replies.length, 1, 'text only: no audio message');
   assert.match(result.replies[0], KANNADA);
   assert.match(result.replies[0], /ಹಾಜರಿ/);

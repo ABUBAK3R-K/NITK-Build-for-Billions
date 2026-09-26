@@ -52,7 +52,7 @@ Object.assign(process.env, {
 });
 
 // ---------- fetch (Groq) ----------
-export const llm = { calls: [], responder: () => JSON.stringify({ intent: 'help', confidence: 80 }) };
+export const llm = { calls: [], responder: () => JSON.stringify({ intent: 'help', confidence: 80, passcode_match: true }) };
 export const transcribe = { text: 'aaj maine teesri manzil pe plaster kiya', fail: false, jobs: [] };
 const realFetch = globalThis.fetch;
 globalThis.fetch = async (url, opts) => {
@@ -81,12 +81,13 @@ const SCHEMA = {
   Workers: { pk: 'worker_id', idx: { PhoneNumberIndex: ['phone_number'] } },
   AttendanceLogs: { pk: 'worker_id', sk: 'log_date', idx: { SiteLogsIndex: ['site_id', 'log_date'], ReviewQueueIndex: ['verification_status', 'timestamp'] } },
   Sites: { pk: 'site_id', idx: { ActiveSitesIndex: ['is_active'] } },
-  Certificates: { pk: 'worker_id', sk: 'certificate_id', idx: { VerificationHashIndex: ['verification_hash'] } },
+  Certificates: { pk: 'worker_id', sk: 'certificate_id', idx: { VerificationHashIndex: ['verification_hash'], CertificateIdIndex: ['certificate_id'] } },
   Documents: { pk: 'worker_id', sk: 'document_id', idx: {} },
   ConversationState: { pk: 'worker_id', sk: 'session_id', idx: {} },
   BedrockCache: { pk: 'input_hash', idx: {} },
   AdminUsers: { pk: 'admin_id', idx: { EmailIndex: ['email'] } },
   RefreshTokens: { pk: 'token_id', idx: {} },
+  AuditLog: { pk: 'subject', sk: 'entry_id', idx: {} },
 };
 export const db = new Map();
 export const ddbLog = [];
@@ -249,8 +250,15 @@ export const M = {
 export async function send(from, msg, extra) {
   const before = wa.sent.length;
   const res = await handler(postEvent(wrap(from, msg, extra)));
-  return { res, replies: wa.sent.slice(before).map((p) => p.text?.body || `[${p.type}${p.interactive ? ':' + p.interactive.type : ''}]`) };
+  return {
+    res,
+    replies: wa.sent.slice(before).map((p) => p.text?.body
+      || (p.interactive?.type === 'button' ? `[buttons] ${p.interactive.body.text}` : null)
+      || `[${p.type}${p.interactive ? ':' + p.interactive.type : ''}]`),
+  };
 }
+/** Tap "I agree" on the consent notice */
+export const agree = (from) => send(from, M.button('consent_agree', 'I agree'));
 export const worker = (phone) => [...table('Workers').values()].find((w) => w.phone_number === phone);
 export const states = (wid) => [...table('ConversationState').values()].filter((s) => s.worker_id === wid);
 export const close = () => server.close();
