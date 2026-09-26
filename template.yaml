@@ -217,6 +217,10 @@ Resources:
           AttributeType: S
         - AttributeName: phone_number
           AttributeType: S
+        - AttributeName: profile_status
+          AttributeType: S
+        - AttributeName: next_reminder_time
+          AttributeType: S
       KeySchema:
         - AttributeName: worker_id
           KeyType: HASH
@@ -225,6 +229,14 @@ Resources:
           KeySchema:
             - AttributeName: phone_number
               KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+        - IndexName: ReminderIndex
+          KeySchema:
+            - AttributeName: profile_status
+              KeyType: HASH
+            - AttributeName: next_reminder_time
+              KeyType: RANGE
           Projection:
             ProjectionType: ALL
       StreamSpecification:
@@ -766,6 +778,32 @@ Resources:
             TableName: !Ref AdminUsersTable
         - DynamoDBCrudPolicy:
             TableName: !Ref RefreshTokensTable
+
+  ProactiveReminderFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'nirman-mitra-proactive-reminder-${Environment}'
+      Handler: src/handlers/proactiveReminder.handler
+      Description: Sends WhatsApp reminders to workers who missed check-ins
+      Timeout: 60
+      Events:
+        ScheduleTimer:
+          Type: Schedule
+          Properties:
+            Schedule: rate(15 minutes)
+            Name: !Sub 'nirman-mitra-reminder-schedule-${Environment}'
+            Description: Run every 15 minutes to check for pending reminders
+            Enabled: true
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref WorkersTable
+        - Statement:
+            - Effect: Allow
+              Action: [dynamodb:Query]
+              Resource: !Sub '${WorkersTable.Arn}/index/ReminderIndex'
+      Environment:
+        Variables:
+          WHATSAPP_REMINDER_TEMPLATE_NAME: 'daily_checkin_reminder'
 
   # ─────────────────────────────────────────────────────────
   # STEP FUNCTIONS
