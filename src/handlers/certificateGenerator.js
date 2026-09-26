@@ -16,8 +16,8 @@ import crypto from 'crypto';
 import { v4 as uuidv4 } from 'uuid';
 import PDFDocument from 'pdfkit';
 import QRCode from 'qrcode';
-import config, { isDemoMode } from '../utils/config.js';
-import { getItem, putItem, queryItems } from '../utils/dynamodb.js';
+import config, { istDate } from '../utils/config.js';
+import { getItem, putItem, queryItems, updateItem } from '../utils/dynamodb.js';
 import { uploadToS3, generatePresignedUrl } from '../utils/s3.js';
 
 export const handler = async (event) => {
@@ -30,7 +30,7 @@ export const handler = async (event) => {
       case 'check_eligibility':
         return await checkEligibility(workerId);
       case 'generate':
-        return await generateCertificate(workerId, event);
+        return await generateCertificate(workerId);
       default:
         return { statusCode: 400, error: `Unknown task: ${task}` };
     }
@@ -89,16 +89,45 @@ async function checkEligibility(workerId) {
 // Generate Certificate
 // ---------------------------------------------------------
 
-async function generateCertificate(workerId, event) {
+async function generateCertificate(workerId) {
   // Verify eligibility
   const eligibility = await checkEligibility(workerId);
   if (!eligibility.eligible) {
     return { success: false, ...eligibility };
   }
 
+  // Claim issuance with a conditional write on the worker, so of two concurrent calls only one
+  // issues a certificate; the other gets certificate_already_exists
+  const certificateId = uuidv4();
+  try {
+    await updateItem(
+      config.tables.workers,
+      { worker_id: workerId },
+      'SET certificate_claim = :cid',
+      { ':cid': certificateId },
+      undefined,
+      'attribute_not_exists(certificate_claim)',
+    );
+  } catch (err) {
+    if (err.name === 'ConditionalCheckFailedException') {
+      return { success: false, eligible: false, reason: 'certificate_already_exists' };
+    }
+    throw err;
+  }
+
+  try {
+    return await issueCertificate(workerId, certificateId);
+  } catch (err) {
+    // Release the claim so a later request can retry
+    await updateItem(config.tables.workers, { worker_id: workerId }, 'REMOVE certificate_claim', undefined)
+      .catch((e) => console.error('[Certificate] Failed to release claim:', e.message));
+    throw err;
+  }
+}
+
+async function issueCertificate(workerId, certificateId) {
   const worker = await getItem(config.tables.workers, { worker_id: workerId });
   const workerName = worker.name || 'Unknown Worker';
-  const language = event.language || worker.preferred_language || 'hi';
 
   // Fetch all attendance logs
   const attendanceLogs = await queryItems(
@@ -127,11 +156,10 @@ async function generateCertificate(workerId, event) {
     .map((l) => l.log_date)
     .filter(Boolean)
     .sort();
-  const dateFrom = sortedDates[0] || new Date().toISOString().split('T')[0];
-  const dateTo = sortedDates[sortedDates.length - 1] || new Date().toISOString().split('T')[0];
+  const dateFrom = sortedDates[0] || istDate();
+  const dateTo = sortedDates[sortedDates.length - 1] || istDate();
 
-  // Generate certificate ID and SHA-256 hash
-  const certificateId = uuidv4();
+  // SHA-256 hash over the certificate data
   const certData = {
     certificateId,
     workerId,
@@ -169,10 +197,13 @@ async function generateCertificate(workerId, event) {
     { worker_id: workerId, certificate_id: certificateId },
   );
 
-  // Store in Certificates table
+  // Store in Certificates table, with a snapshot of the worker's identity as printed on the PDF
+  // (the verify endpoint shows these, even if the worker record changes later)
   const certificateRecord = {
     worker_id: workerId,
     certificate_id: certificateId,
+    worker_name: workerName,
+    aadhaar_last4: certData.aadhaarLast4,
     verification_hash: verificationHash,
     total_days: approvedLogs.length,
     date_from: dateFrom,
@@ -186,11 +217,11 @@ async function generateCertificate(workerId, event) {
 
   await putItem(config.tables.certificates, certificateRecord);
 
-  // Generate pre-signed URL for download
+  // Short-lived: WhatsApp delivery presigns its own link at send time from pdfS3Key
   const downloadUrl = await generatePresignedUrl(
     config.buckets.certificates,
     s3Key,
-    86400, // 24 hours
+    900,
   );
 
   return {
@@ -202,6 +233,7 @@ async function generateCertificate(workerId, event) {
     dateRange: { from: dateFrom, to: dateTo },
     sitesWorked,
     downloadUrl,
+    pdfS3Key: s3Key,
     verificationUrl,
     workerName,
   };

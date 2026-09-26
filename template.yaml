@@ -23,6 +23,11 @@ Parameters:
     Default: ''
     Description: Public URL of the dashboard / officer portal (e.g. https://main.xxxx.amplifyapp.com); certificate QR codes link to <PortalUrl>/verify/<hash>
 
+  AlertEmail:
+    Type: String
+    Default: ''
+    Description: Optional email address for Lambda error alarms (leave empty for no notifications)
+
   DemoPhoneNumbers:
     Type: String
     Default: ''
@@ -84,9 +89,12 @@ Parameters:
 # ─────────────────────────────────────────────────────────────
 # GLOBALS
 # ─────────────────────────────────────────────────────────────
+Conditions:
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmail, '']]
+
 Globals:
   Function:
-    Runtime: nodejs20.x
+    Runtime: nodejs22.x
     Timeout: 30
     MemorySize: 512
     Tracing: Active
@@ -136,6 +144,8 @@ Resources:
 
   MediaRawBucket:
     Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       BucketName: !Sub 'nirman-mitra-media-raw-${AWS::AccountId}'
       BucketEncryption:
@@ -146,6 +156,7 @@ Resources:
         Rules:
           - Id: DeleteRawMediaAfter90Days
             Status: Enabled
+            Prefix: workers/
             ExpirationInDays: 90
       PublicAccessBlockConfiguration:
         BlockPublicAcls: true
@@ -155,6 +166,8 @@ Resources:
 
   MediaProcessedBucket:
     Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       BucketName: !Sub 'nirman-mitra-media-processed-${AWS::AccountId}'
       BucketEncryption:
@@ -174,6 +187,8 @@ Resources:
 
   CertificatesBucket:
     Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       BucketName: !Sub 'nirman-mitra-certificates-${AWS::AccountId}'
       BucketEncryption:
@@ -192,6 +207,8 @@ Resources:
 
   WorkersTable:
     Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       TableName: !Sub 'NirmanMitra-Workers-${Environment}'
       BillingMode: PAY_PER_REQUEST
@@ -217,6 +234,8 @@ Resources:
 
   AttendanceLogsTable:
     Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       TableName: !Sub 'NirmanMitra-AttendanceLogs-${Environment}'
       BillingMode: PAY_PER_REQUEST
@@ -258,6 +277,8 @@ Resources:
 
   SitesTable:
     Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       TableName: !Sub 'NirmanMitra-Sites-${Environment}'
       BillingMode: PAY_PER_REQUEST
@@ -281,6 +302,8 @@ Resources:
 
   CertificatesTable:
     Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       TableName: !Sub 'NirmanMitra-Certificates-${Environment}'
       BillingMode: PAY_PER_REQUEST
@@ -308,6 +331,8 @@ Resources:
 
   DocumentsTable:
     Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       TableName: !Sub 'NirmanMitra-Documents-${Environment}'
       BillingMode: PAY_PER_REQUEST
@@ -326,6 +351,8 @@ Resources:
 
   ConversationStateTable:
     Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       TableName: !Sub 'NirmanMitra-ConversationState-${Environment}'
       BillingMode: PAY_PER_REQUEST
@@ -345,6 +372,8 @@ Resources:
 
   BedrockCacheTable:
     Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       TableName: !Sub 'NirmanMitra-BedrockCache-${Environment}'
       BillingMode: PAY_PER_REQUEST
@@ -360,6 +389,8 @@ Resources:
 
   AdminUsersTable:
     Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       TableName: !Sub 'NirmanMitra-AdminUsers-${Environment}'
       BillingMode: PAY_PER_REQUEST
@@ -383,6 +414,8 @@ Resources:
 
   RefreshTokensTable:
     Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       TableName: !Sub 'NirmanMitra-RefreshTokens-${Environment}'
       BillingMode: PAY_PER_REQUEST
@@ -445,6 +478,11 @@ Resources:
       FunctionName: !Sub 'nirman-mitra-message-handler-${Environment}'
       Handler: src/handlers/messageHandler.handler
       Description: WhatsApp webhook receiver — routes messages to appropriate flows
+      # The webhook call only verifies and hands off; the async self-invocation does the slow work
+      Timeout: 120
+      Environment:
+        Variables:
+          ASYNC_WEBHOOK: 'true'
       Events:
         WhatsAppWebhookGet:
           Type: Api
@@ -487,11 +525,21 @@ Resources:
                 - !Ref AttendanceFlowStateMachine
         - Statement:
             - Effect: Allow
+              Action: [lambda:InvokeFunction]
+              Resource: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:nirman-mitra-message-handler-${Environment}'
+        - Statement:
+            - Effect: Allow
               Action: [polly:SynthesizeSpeech]
               Resource: '*'
         - Statement:
             - Effect: Allow
-              Action: [rekognition:CompareFaces, rekognition:SearchFacesByImage, rekognition:IndexFaces, rekognition:CreateCollection]
+              Action:
+                - rekognition:CompareFaces
+                - rekognition:SearchFacesByImage
+                - rekognition:IndexFaces
+                - rekognition:DeleteFaces
+                - rekognition:DetectFaces
+                - rekognition:CreateCollection
               Resource: '*'
         - DynamoDBCrudPolicy:
             TableName: !Ref BedrockCacheTable
@@ -539,7 +587,7 @@ Resources:
             TableName: !Ref WorkersTable
         - DynamoDBCrudPolicy:
             TableName: !Ref DocumentsTable
-        - S3ReadPolicy:
+        - S3CrudPolicy:
             BucketName: !Ref MediaRawBucket
         - S3CrudPolicy:
             BucketName: !Ref MediaProcessedBucket
@@ -553,6 +601,7 @@ Resources:
             - Effect: Allow
               Action:
                 - rekognition:IndexFaces
+                - rekognition:DeleteFaces
                 - rekognition:CreateCollection
                 - rekognition:SearchFacesByImage
                 - rekognition:CompareFaces
@@ -690,6 +739,18 @@ Resources:
             RestApiId: !Ref NirmanMitraApi
             Path: /api/admin/site-breakdown
             Method: GET
+        ListSites:
+          Type: Api
+          Properties:
+            RestApiId: !Ref NirmanMitraApi
+            Path: /api/admin/sites
+            Method: GET
+        UpsertSite:
+          Type: Api
+          Properties:
+            RestApiId: !Ref NirmanMitraApi
+            Path: /api/admin/sites
+            Method: POST
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref WorkersTable
@@ -815,18 +876,49 @@ Resources:
   # CLOUDWATCH ALARMS
   # ─────────────────────────────────────────────────────────
 
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Condition: HasAlertEmail
+    Properties:
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref AlertEmail
+
   LambdaErrorAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
       AlarmName: !Sub 'NirmanMitra-LambdaErrors-${Environment}'
-      AlarmDescription: Alert when Lambda error rate exceeds 5
+      AlarmDescription: More than 5 errors in 5 minutes from MessageHandlerFunction
       MetricName: Errors
       Namespace: AWS/Lambda
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref MessageHandlerFunction
       Statistic: Sum
       Period: 300
       EvaluationPeriods: 1
       Threshold: 5
       ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlertEmail, [!Ref AlertTopic], !Ref 'AWS::NoValue']
+
+  AdminApiErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'NirmanMitra-AdminApiError-${Environment}'
+      AlarmDescription: More than 5 errors in 5 minutes from AdminApiFunction
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref AdminApiFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlertEmail, [!Ref AlertTopic], !Ref 'AWS::NoValue']
 
   DLQDepthAlarm:
     Type: AWS::CloudWatch::Alarm

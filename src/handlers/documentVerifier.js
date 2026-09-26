@@ -5,8 +5,8 @@
  * Textract OCR + name cross-validation for identity documents.
  */
 
-import config, { apiResponse } from '../utils/config.js';
-import { downloadFromS3 } from '../utils/s3.js';
+import config from '../utils/config.js';
+import { downloadFromS3, deleteFromS3 } from '../utils/s3.js';
 import {
   extractAadhaarFields,
   extractBankFields,
@@ -14,13 +14,9 @@ import {
   assessDocumentQuality,
   crossValidateNames,
 } from '../services/documentOcr.js';
-import {
-  handleAadhaarUpload,
-  handleSelfieCapture,
-  handleBankPassbook,
-} from '../services/registration.js';
+import { handleSelfieCapture } from '../services/registration.js';
 import { getAadhaarLast4 } from '../utils/aadhaar.js';
-import { putItem, getItem, queryItems } from '../utils/dynamodb.js';
+import { putItem, queryItems } from '../utils/dynamodb.js';
 import { v4 as uuidv4 } from 'uuid';
 
 export const handler = async (event) => {
@@ -79,11 +75,16 @@ export const handler = async (event) => {
 async function processAadhaarDocument(event) {
   const { workerId, imageKey, bucket } = event;
 
-  // Download image from S3
+  // Download image from S3, then delete it: the only Aadhaar data kept is the last 4 digits
   const imageBuffer = await downloadFromS3(
     bucket || config.buckets.mediaRaw,
     imageKey,
   );
+  try {
+    await deleteFromS3(bucket || config.buckets.mediaRaw, imageKey);
+  } catch (err) {
+    console.error('Failed to delete Aadhaar image after download:', err.message);
+  }
 
   // Check quality
   const quality = await assessDocumentQuality(imageBuffer);
@@ -104,6 +105,12 @@ async function processAadhaarDocument(event) {
 
   // Validate Aadhaar number
   const isValid = fields.aadhaar_number ? verhoeffChecksum(fields.aadhaar_number) : false;
+  if (!isValid) {
+    return {
+      statusCode: 200,
+      body: JSON.stringify({ success: false, reason: 'invalid_aadhaar_number', message: 'No valid Aadhaar number found' }),
+    };
+  }
 
   // Keep only the last 4 digits; the full number is never stored
   let last4 = '';
@@ -126,7 +133,6 @@ async function processAadhaarDocument(event) {
     },
     ocr_confidence: fields.confidence,
     verhoeff_valid: isValid,
-    s3_key: imageKey,
     created_at: new Date().toISOString(),
   });
 
@@ -199,7 +205,7 @@ async function processSelfieDocument(event) {
     imageKey,
   );
 
-  const result = await handleSelfieCapture(workerId, imageBuffer, 'hi');
+  const result = await handleSelfieCapture(workerId, imageBuffer, event.language || 'hi');
 
   return {
     statusCode: 200,

@@ -131,8 +131,13 @@ export async function sendDocumentMessage(phoneNumber, docUrl, filename, caption
     return { success: true, demo: true, messageId: `demo-${Date.now()}` };
   }
 
-  const response = await axios.post(apiUrl(), payload, { headers: headers() });
-  return { success: true, messageId: response.data.messages?.[0]?.id };
+  try {
+    const response = await axios.post(apiUrl(), payload, { headers: headers() });
+    return { success: true, messageId: response.data.messages?.[0]?.id };
+  } catch (err) {
+    console.error('[WhatsApp] sendDocument failed:', err.response?.status, JSON.stringify(err.response?.data));
+    throw err;
+  }
 }
 
 /**
@@ -222,22 +227,39 @@ export function validateMetaSignature(rawBody, signatureHeader) {
 }
 
 /**
- * Parse incoming WhatsApp webhook payload
- * Extracts the essential fields from Meta's nested structure.
+ * Parse every message in an incoming WhatsApp webhook payload.
+ * Meta may batch several messages (across entries and changes) into one POST; status
+ * updates carry no messages and yield an empty array.
+ * @param {object} body - Raw POST body from webhook
+ * @returns {object[]} Parsed messages, in payload order
+ */
+export function parseWebhookMessages(body) {
+  const parsed = [];
+  for (const entry of body?.entry || []) {
+    for (const change of entry?.changes || []) {
+      const value = change?.value;
+      for (const message of value?.messages || []) {
+        const contact = value.contacts?.find((c) => c.wa_id === message.from) || value.contacts?.[0];
+        const result = parseMessage(message, contact);
+        if (result) parsed.push(result);
+      }
+    }
+  }
+  return parsed;
+}
+
+/**
+ * Parse the first message of an incoming WhatsApp webhook payload
  * @param {object} body - Raw POST body from webhook
  * @returns {object|null} Parsed message or null if not a valid message
  */
 export function parseWebhookMessage(body) {
+  return parseWebhookMessages(body)[0] || null;
+}
+
+/** Extract the essential fields of one message from Meta's nested structure */
+function parseMessage(message, contact) {
   try {
-    const entry = body?.entry?.[0];
-    const changes = entry?.changes?.[0];
-    const value = changes?.value;
-
-    if (!value?.messages?.length) return null;
-
-    const message = value.messages[0];
-    const contact = value.contacts?.[0];
-
     const parsed = {
       messageId: message.id,
       from: message.from, // phone number in international format
@@ -270,6 +292,24 @@ export function parseWebhookMessage(body) {
         parsed.mimeType = message.document?.mime_type;
         parsed.filename = message.document?.filename;
         break;
+      case 'interactive': {
+        // A tapped reply button / list row reads like the worker typing its title
+        const reply = message.interactive?.button_reply || message.interactive?.list_reply;
+        if (reply) {
+          parsed.type = 'text';
+          parsed.text = reply.title || '';
+          parsed.buttonId = reply.id;
+        } else {
+          parsed.raw = message;
+        }
+        break;
+      }
+      case 'button':
+        // Quick-reply button on a template message
+        parsed.type = 'text';
+        parsed.text = message.button?.text || '';
+        parsed.buttonId = message.button?.payload;
+        break;
       default:
         parsed.raw = message;
     }
@@ -290,4 +330,5 @@ export default {
   downloadMedia,
   validateMetaSignature,
   parseWebhookMessage,
+  parseWebhookMessages,
 };

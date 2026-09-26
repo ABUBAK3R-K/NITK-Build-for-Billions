@@ -11,17 +11,26 @@
  */
 
 import { LexRuntimeV2Client, RecognizeTextCommand } from '@aws-sdk/client-lex-runtime-v2';
-import config, { apiResponse, isDemoMode } from '../utils/config.js';
-import { getWorkerByPhone, getConversationState, saveConversationState, getItem } from '../utils/dynamodb.js';
+import { LambdaClient, InvokeCommand } from '@aws-sdk/client-lambda';
+import config, { apiResponse, isDemoMode, istDate } from '../utils/config.js';
 import {
-  parseWebhookMessage,
+  getWorkerByPhone,
+  getConversationState,
+  saveConversationState,
+  updateItem,
+  queryItems,
+} from '../utils/dynamodb.js';
+import {
+  parseWebhookMessages,
   validateMetaSignature,
   downloadMedia,
   sendTextMessage,
   sendAudioMessage,
+  sendDocumentMessage,
   sendLocationRequest,
 } from '../utils/whatsapp.js';
-import { uploadWorkerMedia } from '../utils/s3.js';
+import { uploadWorkerMedia, generatePresignedUrl } from '../utils/s3.js';
+import { putItemIfAbsent } from '../services/conditionalWrite.js';
 import {
   handleGreeting,
   handleNameCapture,
@@ -29,19 +38,36 @@ import {
   handleSelfieCapture,
   finalizeRegistration,
 } from '../services/registration.js';
-import { transcribeVoice, detectLanguage, generateAndUploadVoice } from '../services/voiceProcessor.js';
+import {
+  transcribeVoice,
+  parseLanguageSwitch,
+  generateAndUploadVoice,
+  getGreetingMessage,
+  getStepPrompt,
+} from '../services/voiceProcessor.js';
 import { complete } from '../providers/llm.js';
 import { withRetry } from '../utils/retryHelper.js';
+import { t, KN, languageName } from '../utils/i18n.js';
 import { handler as attendanceHandler } from './attendanceProcessor.js';
 import { handler as certificateHandler } from './certificateGenerator.js';
 
 // Optional Lex V2 intent layer (used only when LEX_BOT_ID is configured)
 const lexClient = new LexRuntimeV2Client({ region: config.aws.region });
+const lambdaClient = new LambdaClient({ region: config.aws.region });
 const LEX_BOT_ID = process.env.LEX_BOT_ID || '';
 const LEX_BOT_ALIAS_ID = process.env.LEX_BOT_ALIAS_ID || '';
 const LEX_LOCALE = process.env.LEX_LOCALE_ID || 'en_US';
 
+const ASYNC_EVENT_SOURCE = 'nirman-mitra.webhook';
+
 export const handler = async (event) => {
+  // Second half of an async webhook: the verified payload, re-invoked by the first half below
+  if (event?.source === ASYNC_EVENT_SOURCE) {
+    const results = await handleIncomingMessages(event.payload);
+    console.log('Webhook results (async):', results.map((r) => r.body).join(' '));
+    return { status: 'processed' };
+  }
+
   const method = event.httpMethod || event.requestContext?.http?.method;
 
   try {
@@ -59,8 +85,22 @@ export const handler = async (event) => {
         return apiResponse(403, { error: 'Invalid signature' });
       }
 
-      const result = await handleIncomingMessage(JSON.parse(rawBody));
-      console.log('Webhook result:', result.body);
+      const payload = JSON.parse(rawBody);
+
+      // Meta expects a quick 200 and API Gateway stops waiting at 29 s, while transcription and
+      // certificate generation can take longer. So acknowledge now and process in a second,
+      // asynchronous invocation of this function. Duplicate message ids are skipped downstream.
+      if (config.asyncWebhook) {
+        await lambdaClient.send(new InvokeCommand({
+          FunctionName: process.env.AWS_LAMBDA_FUNCTION_NAME,
+          InvocationType: 'Event',
+          Payload: Buffer.from(JSON.stringify({ source: ASYNC_EVENT_SOURCE, payload })),
+        }));
+        return apiResponse(200, { status: 'received' });
+      }
+
+      const results = await handleIncomingMessages(payload);
+      console.log('Webhook results:', results.map((r) => r.body).join(' '));
       return apiResponse(200, { status: 'received' });
     }
 
@@ -105,12 +145,61 @@ function getHeader(event, name) {
 // POST — Incoming WhatsApp Message
 // ─────────────────────────────────────────────────────────
 
-async function handleIncomingMessage(body) {
-  // Parse the WhatsApp webhook payload
-  const message = parseWebhookMessage(body);
-  if (!message) {
+// Message types a worker sends on purpose. Reactions, stickers, "unsupported" and system
+// messages are ignored: they must not register a worker or advance a flow.
+const USER_CONTENT_TYPES = new Set(['text', 'image', 'audio', 'video', 'document', 'location', 'interactive']);
+
+// Processed WhatsApp message ids are remembered this long, covering Meta's redelivery window
+const DEDUP_TTL_SECONDS = 2 * 24 * 60 * 60;
+
+/** Handle every message in a webhook payload (Meta may batch several into one POST) */
+async function handleIncomingMessages(body) {
+  const messages = parseWebhookMessages(body);
+  if (messages.length === 0) {
     // Not a message event (could be status update) — acknowledge
-    return apiResponse(200, { status: 'not_a_message' });
+    return [apiResponse(200, { status: 'not_a_message' })];
+  }
+
+  const results = [];
+  for (const message of messages) {
+    try {
+      results.push(await handleIncomingMessage(message));
+    } catch (err) {
+      // One failing message must not stop the rest of the batch
+      console.error(`Error handling message ${message.messageId}:`, err);
+      results.push(apiResponse(200, { status: 'error', error: err.message }));
+    }
+  }
+  return results;
+}
+
+/**
+ * Record a message id; false if it was already processed. Meta redelivers a message when it
+ * does not get a timely 200, and the second delivery must not run the flow again.
+ */
+async function markMessageProcessed(messageId) {
+  if (!messageId) return true;
+  return putItemIfAbsent(
+    config.tables.conversation,
+    {
+      worker_id: `msg#${messageId}`,
+      session_id: 'dedup',
+      ttl: Math.floor(Date.now() / 1000) + DEDUP_TTL_SECONDS,
+      created_at: new Date().toISOString(),
+    },
+    { worker_id: `msg#${messageId}`, session_id: 'dedup' },
+  );
+}
+
+async function handleIncomingMessage(message) {
+  if (!USER_CONTENT_TYPES.has(message.type)) {
+    console.log(`Ignoring ${message.type} message from ${message.from}`);
+    return apiResponse(200, { status: 'ignored_message_type', type: message.type });
+  }
+
+  if (!(await markMessageProcessed(message.messageId))) {
+    console.log(`Ignoring redelivered message ${message.messageId}`);
+    return apiResponse(200, { status: 'duplicate_message' });
   }
 
   console.log(`Incoming ${message.type} from ${message.from}:`, JSON.stringify(message).substring(0, 200));
@@ -127,6 +216,12 @@ async function handleIncomingMessage(body) {
 
   // Existing worker — route based on profile status
   const { profile_status, worker_id: workerId } = existingWorker;
+
+  // "English" / "Hindi" / "ಕನ್ನಡ" switches language at any step
+  const switchTo = message.type === 'text' ? parseLanguageSwitch(message.text) : null;
+  if (switchTo) {
+    return await handleLanguageSwitch(workerId, existingWorker, message, switchTo);
+  }
 
   if (profile_status === 'onboarding') {
     return await handleOnboardingWorker(workerId, existingWorker, message);
@@ -163,6 +258,66 @@ async function handleNewWorker(phoneNumber, message) {
 }
 
 // ─────────────────────────────────────────────────────────
+// Language Switch (any step)
+// ─────────────────────────────────────────────────────────
+
+async function handleLanguageSwitch(workerId, worker, message, language) {
+  await updateItem(
+    config.tables.workers,
+    { worker_id: workerId },
+    'SET preferred_language = :lang, updated_at = :ts',
+    { ':lang': language, ':ts': new Date().toISOString() },
+  );
+
+  let responseText = t(language, {
+    en: 'Language changed to English.',
+    hi: 'Bhasha badal di gayi hai.',
+    kn: KN.languageChanged,
+  });
+
+  // Remind an onboarding worker what the current step expects
+  if (worker.profile_status === 'onboarding') {
+    const state = await getConversationState(workerId);
+    const step = worker.admin_flag ? 'admin_flagged' : state?.current_step || 'awaiting_name';
+    const reminder = onboardingStepReminder(step, language);
+    if (reminder) responseText += `\n\n${reminder}`;
+  }
+
+  await sendTextAndVoice(message.from, workerId, responseText, language, 'language-changed');
+  return apiResponse(200, { status: 'language_changed', workerId, language });
+}
+
+/** What an onboarding step is waiting for, as a short prompt */
+function onboardingStepReminder(step, language) {
+  switch (step) {
+    case 'awaiting_name':
+      return getStepPrompt('awaiting_name', language);
+    case 'awaiting_aadhaar':
+      return t(language, { en: 'Please send a photo of your Aadhaar card.', hi: 'Kripya apne Aadhaar card ka photo bhejiye.', kn: KN.aadhaarReminder });
+    case 'awaiting_selfie':
+      return t(language, { en: 'Please send a selfie photo.', hi: 'Kripya apna selfie photo bhejiye.', kn: KN.selfieReminder });
+    case 'awaiting_registration_location':
+      return t(language, {
+        en: 'Please share your work site location using the button, or send "ok" to skip.',
+        hi: 'Kripya apne kaam ki jagah ka location share karein, ya "ok" bhejiye skip karne ke liye.',
+        kn: KN.registrationLocationReminder,
+      });
+    case 'admin_flagged':
+      return adminFlaggedText(language);
+    default:
+      return null;
+  }
+}
+
+function adminFlaggedText(language) {
+  return t(language, {
+    en: 'Your document is with an admin for review. We will message you here once it is checked.',
+    hi: 'Aapka document admin ke paas review ke liye hai. Check hone par hum aapko yahin message karenge.',
+    kn: KN.adminFlagged,
+  });
+}
+
+// ─────────────────────────────────────────────────────────
 // Route: Onboarding Worker (In-Progress Registration)
 // ─────────────────────────────────────────────────────────
 
@@ -170,9 +325,10 @@ async function handleOnboardingWorker(workerId, worker, message) {
   const phoneNumber = message.from;
   const language = worker.preferred_language || 'hi';
 
-  // Get current conversation state
+  // Get current conversation state. A worker flagged for an admin stays flagged even after
+  // the conversation row expires, instead of restarting registration.
   const state = await getConversationState(workerId);
-  const currentStep = state?.current_step || 'awaiting_name';
+  const currentStep = worker.admin_flag ? 'admin_flagged' : state?.current_step || 'awaiting_name';
   const retryCount = state?.retry_count || 0;
   const sessionId = worker.worker_id;
 
@@ -203,11 +359,17 @@ async function handleOnboardingWorker(workerId, worker, message) {
         result.nextStep = 'completed';
         break;
 
+      case 'admin_flagged':
+        result = { responseText: adminFlaggedText(language), nextStep: 'admin_flagged', consumesRetry: false };
+        break;
+
       default:
         result = {
-          responseText: language === 'en'
-            ? 'Please send your name to continue registration.'
-            : 'Kripya apna naam bhejiye registration jari rakhne ke liye.',
+          responseText: t(language, {
+            en: 'Please send your name to continue registration.',
+            hi: 'Kripya apna naam bhejiye registration jari rakhne ke liye.',
+            kn: KN.sendNameToContinue,
+          }),
           nextStep: 'awaiting_name',
         };
     }
@@ -220,9 +382,11 @@ async function handleOnboardingWorker(workerId, worker, message) {
       }
       // Send location request button
       try {
-        const locText = language === 'en'
-          ? 'Tap the button below to share your work site location.'
-          : 'Apne kaam ki jagah ka location share karne ke liye neeche button dabayein.';
+        const locText = t(language, {
+          en: 'Tap the button below to share your work site location.',
+          hi: 'Apne kaam ki jagah ka location share karne ke liye neeche button dabayein.',
+          kn: KN.registrationLocationButton,
+        });
         await sendLocationRequest(phoneNumber, locText);
       } catch (err) {
         console.warn('[Registration] Location request button failed:', err.message);
@@ -262,12 +426,17 @@ async function handleOnboardingWorker(workerId, worker, message) {
       });
     }
 
-    // Update conversation state with next step
+    // Update conversation state with next step. Staying on a step counts as a retry unless the
+    // step says otherwise (wrong message type, service outage).
     if (result.nextStep && result.nextStep !== 'completed') {
+      let nextRetryCount = 0;
+      if (result.nextStep === currentStep) {
+        nextRetryCount = result.consumesRetry === false ? retryCount : retryCount + 1;
+      }
       await saveConversationState(workerId, sessionId, {
         current_step: result.nextStep,
         preferred_language: language,
-        retry_count: result.nextStep === currentStep ? retryCount + 1 : 0,
+        retry_count: nextRetryCount,
       });
     }
 
@@ -285,9 +454,11 @@ async function handleOnboardingWorker(workerId, worker, message) {
   } catch (err) {
     console.error(`Error in onboarding step ${currentStep}:`, err);
 
-    const errorText = language === 'en'
-      ? 'Something went wrong. Please try again.'
-      : 'Kuch problem ho gayi. Kripya dobara koshish karein.';
+    const errorText = t(language, {
+      en: 'Something went wrong. Please try again.',
+      hi: 'Kuch problem ho gayi. Kripya dobara koshish karein.',
+      kn: KN.tryAgain,
+    });
     await sendTextMessage(phoneNumber, errorText);
 
     return apiResponse(200, { status: 'error', step: currentStep, error: err.message });
@@ -298,9 +469,17 @@ async function handleOnboardingWorker(workerId, worker, message) {
 // Step Processors
 // ─────────────────────────────────────────────────────────
 
+// A bare greeting at the name step is not a name (e.g. the worker never got the greeting and
+// says hello again)
+const GREETING_ONLY = /^(?:hi+|hello|helo|hey|hlo|namaste|namaskar|namaskara|namaskaram|vanakkam|good morning|नमस्ते|नमस्कार|ನಮಸ್ಕಾರ)[\s!.]*$/iu;
+
 async function processNameStep(workerId, message, language) {
   let audioBuffer = null;
   let textMessage = null;
+
+  if (message.type === 'text' && GREETING_ONLY.test((message.text || '').trim())) {
+    return { responseText: getGreetingMessage(language), nextStep: 'awaiting_name', consumesRetry: false };
+  }
 
   if (message.type === 'audio') {
     const media = await downloadMedia(message.mediaId);
@@ -310,9 +489,11 @@ async function processNameStep(workerId, message, language) {
   } else {
     // Unsupported type for this step
     return {
-      responseText: language === 'en'
-        ? 'Please say or type your name.'
-        : 'Kripya apna naam boliye ya type kariye.',
+      responseText: t(language, {
+        en: 'Please say or type your name.',
+        hi: 'Kripya apna naam boliye ya type kariye.',
+        kn: KN.sayName,
+      }),
       nextStep: 'awaiting_name',
     };
   }
@@ -322,11 +503,15 @@ async function processNameStep(workerId, message, language) {
 
 async function processAadhaarStep(workerId, message, language, retryCount) {
   if (message.type !== 'image') {
+    // Only a failed photo counts against the Aadhaar attempts
     return {
-      responseText: language === 'en'
-        ? 'Please send a photo of your Aadhaar card.'
-        : 'Kripya apne Aadhaar card ka photo bhejiye.',
+      responseText: t(language, {
+        en: 'Please send a photo of your Aadhaar card.',
+        hi: 'Kripya apne Aadhaar card ka photo bhejiye.',
+        kn: KN.aadhaarReminder,
+      }),
       nextStep: 'awaiting_aadhaar',
+      consumesRetry: false,
     };
   }
 
@@ -337,9 +522,11 @@ async function processAadhaarStep(workerId, message, language, retryCount) {
 async function processSelfieStep(workerId, message, language) {
   if (message.type !== 'image') {
     return {
-      responseText: language === 'en'
-        ? 'Please send a selfie photo.'
-        : 'Kripya apna selfie photo bhejiye.',
+      responseText: t(language, {
+        en: 'Please send a selfie photo.',
+        hi: 'Kripya apna selfie photo bhejiye.',
+        kn: KN.selfieReminder,
+      }),
       nextStep: 'awaiting_selfie',
     };
   }
@@ -351,7 +538,6 @@ async function processSelfieStep(workerId, message, language) {
 async function processRegistrationLocationStep(workerId, message, language) {
   if (message.type === 'location') {
     // Store the worker's site location
-    const { updateItem } = await import('../utils/dynamodb.js');
     await updateItem(
       config.tables.workers,
       { worker_id: workerId },
@@ -365,9 +551,11 @@ async function processRegistrationLocationStep(workerId, message, language) {
       },
     );
 
-    const responseText = language === 'en'
-      ? 'Location saved! Finalizing your registration...'
-      : 'Location save ho gaya! Aapka registration poora kar rahe hain...';
+    const responseText = t(language, {
+      en: 'Location saved! Finalizing your registration...',
+      hi: 'Location save ho gaya! Aapka registration poora kar rahe hain...',
+      kn: KN.registrationLocationSaved,
+    });
     const audioUrl = await generateAndUploadVoice(workerId, responseText, language, 'location-saved');
     return { responseText, audioUrl, nextStep: 'finalizing' };
   }
@@ -376,17 +564,21 @@ async function processRegistrationLocationStep(workerId, message, language) {
   if (message.type === 'text') {
     const lower = (message.text || '').toLowerCase().trim();
     if (/\b(ok|skip|done|haan|bas)\b/.test(lower)) {
-      const responseText = language === 'en'
-        ? 'Location skipped. Finalizing your registration...'
-        : 'Location skip kiya. Aapka registration poora kar rahe hain...';
+      const responseText = t(language, {
+        en: 'Location skipped. Finalizing your registration...',
+        hi: 'Location skip kiya. Aapka registration poora kar rahe hain...',
+        kn: KN.registrationLocationSkipped,
+      });
       return { responseText, audioUrl: null, nextStep: 'finalizing' };
     }
   }
 
   // Not a location message — re-prompt
-  const responseText = language === 'en'
-    ? 'Please share your work site location using the button, or send "ok" to skip.'
-    : 'Kripya apne kaam ki jagah ka location share karein, ya "ok" bhejiye skip karne ke liye.';
+  const responseText = t(language, {
+    en: 'Please share your work site location using the button, or send "ok" to skip.',
+    hi: 'Kripya apne kaam ki jagah ka location share karein, ya "ok" bhejiye skip karne ke liye.',
+    kn: KN.registrationLocationReminder,
+  });
   return { responseText, audioUrl: null, nextStep: 'awaiting_registration_location' };
 }
 
@@ -424,9 +616,11 @@ async function handleActiveWorker(workerId, worker, message) {
           pending_latitude: null,
           pending_longitude: null,
         });
-        const voiceText = language === 'en'
-          ? 'Now hold the mic button and tell us:\n• What work did you do today?\n• Which floor or area?\n\nExample: "Today I did painting work on 3rd floor"\n\nOr send "ok" to skip.'
-          : 'Ab mic button dabake bataiye:\n• Aaj kya kaam kiya?\n• Kaun si jagah pe?\n\nJaise: "Aaj maine 3rd floor pe painting ka kaam kiya"\n\nYa "ok" bhejiye skip karne ke liye.';
+        const voiceText = t(language, {
+          en: 'Now hold the mic button and tell us:\n• What work did you do today?\n• Which floor or area?\n\nExample: "Today I did painting work on 3rd floor"\n\nOr send "ok" to skip.',
+          hi: 'Ab mic button dabake bataiye:\n• Aaj kya kaam kiya?\n• Kaun si jagah pe?\n\nJaise: "Aaj maine 3rd floor pe painting ka kaam kiya"\n\nYa "ok" bhejiye skip karne ke liye.',
+          kn: KN.voiceAskAfterSkip,
+        });
         await sendTextMessage(phoneNumber, voiceText);
         return apiResponse(200, { status: 'location_skipped_awaiting_voice', workerId });
       }
@@ -453,16 +647,20 @@ async function handleActiveWorker(workerId, worker, message) {
         pending_latitude: message.latitude,
         pending_longitude: message.longitude,
       });
-      const voiceText = language === 'en'
-        ? 'Location received! Now hold the mic button and tell us:\n• What work did you do today?\n• Which floor or area?\n\nExample: "Today I did painting work on 3rd floor"\n\nOr send "ok" to skip.'
-        : 'Location mil gaya! Ab mic button dabake bataiye:\n• Aaj kya kaam kiya?\n• Kaun si jagah pe?\n\nJaise: "Aaj maine 3rd floor pe painting ka kaam kiya"\n\nYa "ok" bhejiye skip karne ke liye.';
+      const voiceText = t(language, {
+        en: 'Location received! Now hold the mic button and tell us:\n• What work did you do today?\n• Which floor or area?\n\nExample: "Today I did painting work on 3rd floor"\n\nOr send "ok" to skip.',
+        hi: 'Location mil gaya! Ab mic button dabake bataiye:\n• Aaj kya kaam kiya?\n• Kaun si jagah pe?\n\nJaise: "Aaj maine 3rd floor pe painting ka kaam kiya"\n\nYa "ok" bhejiye skip karne ke liye.',
+        kn: KN.voiceAskAfterLocation,
+      });
       await sendTextMessage(phoneNumber, voiceText);
       return apiResponse(200, { status: 'location_stored_awaiting_voice', workerId });
     }
     // Location without prior selfie
-    const responseText = language === 'en'
-      ? 'Location received! Now send a selfie to start attendance.'
-      : 'Location mil gaya! Ab selfie bhejiye attendance shuru karne ke liye.';
+    const responseText = t(language, {
+      en: 'Location received! Now send a selfie to start attendance.',
+      hi: 'Location mil gaya! Ab selfie bhejiye attendance shuru karne ke liye.',
+      kn: KN.locationNoSelfie,
+    });
     await sendTextMessage(phoneNumber, responseText);
     return apiResponse(200, { status: 'location_received_no_selfie', workerId });
   }
@@ -473,7 +671,7 @@ async function handleActiveWorker(workerId, worker, message) {
       // Transcribe and process attendance
       try {
         const media = await downloadMedia(message.mediaId);
-        const transcription = await transcribeVoice(media.buffer, language);
+        const transcription = await transcribeVoice(media.buffer, language, workerId);
         console.log(`[Attendance Voice] Worker ${workerId}: "${transcription}"`);
         return await processFullAttendance(workerId, worker, language, state, transcription || null);
       } catch (err) {
@@ -484,9 +682,11 @@ async function handleActiveWorker(workerId, worker, message) {
     return await handleVoiceConversation(workerId, worker, message, language);
   }
 
-  const responseText = language === 'en'
-    ? 'Send a selfie + voice note to log attendance, or type "progress" to check your status.'
-    : 'Attendance ke liye selfie + voice note bhejiye, ya "progress" type karein apna status dekhne ke liye.';
+  const responseText = t(language, {
+    en: 'Send a selfie + voice note to log attendance, or type "progress" to check your status.',
+    hi: 'Attendance ke liye selfie + voice note bhejiye, ya "progress" type karein apna status dekhne ke liye.',
+    kn: KN.activeGuidance,
+  });
   await sendTextMessage(phoneNumber, responseText);
   return apiResponse(200, { status: 'guidance_sent', workerId });
 }
@@ -518,14 +718,16 @@ async function handleVoiceConversation(workerId, worker, message, language) {
   try {
     // Step 1: Download and transcribe the voice note
     const media = await downloadMedia(message.mediaId);
-    const transcription = await transcribeVoice(media.buffer, language);
+    const transcription = await transcribeVoice(media.buffer, language, workerId);
 
     console.log(`[VoiceAI] Worker ${workerId} said: "${transcription}"`);
 
     if (!transcription || transcription.length < 2) {
-      const responseText = language === 'en'
-        ? 'I could not understand the voice note. Please try again in a quieter place, or type your question.'
-        : 'Voice note samajh nahi aaya. Kripya shant jagah se dobara boliye, ya apna sawaal type kariye.';
+      const responseText = t(language, {
+        en: 'I could not understand the voice note. Please try again in a quieter place, or type your question.',
+        hi: 'Voice note samajh nahi aaya. Kripya shant jagah se dobara boliye, ya apna sawaal type kariye.',
+        kn: KN.voiceUnclear,
+      });
       await sendTextAndVoice(phoneNumber, workerId, responseText, language, 'voice-retry');
       return apiResponse(200, { status: 'voice_unclear', workerId });
     }
@@ -541,9 +743,11 @@ async function handleVoiceConversation(workerId, worker, message, language) {
     return result;
   } catch (err) {
     console.error('[VoiceAI] Error:', err.message);
-    const errorText = language === 'en'
-      ? 'Something went wrong. Please try again or type your question.'
-      : 'Kuch problem ho gayi. Dobara koshish kariye ya apna sawaal type kariye.';
+    const errorText = t(language, {
+      en: 'Something went wrong. Please try again or type your question.',
+      hi: 'Kuch problem ho gayi. Dobara koshish kariye ya apna sawaal type kariye.',
+      kn: KN.voiceError,
+    });
     await sendTextMessage(phoneNumber, errorText);
     return apiResponse(200, { status: 'voice_error', workerId, error: err.message });
   }
@@ -574,6 +778,15 @@ function isDemoPhone(phoneNumber) {
   return Boolean(digits) && config.demoPhoneNumbers.includes(digits);
 }
 
+// Checked in order: certificate before progress, as for the romanized keywords
+const KANNADA_INTENT_KEYWORDS = [
+  ['request_certificate', /ಸರ್ಟಿಫಿಕೇಟ್|ಪ್ರಮಾಣ ?ಪತ್ರ/u],
+  ['check_progress', /ಪ್ರಗತಿ|ಪ್ರೋಗ್ರೆಸ್|ಎಷ್ಟು ದಿನ|ಸ್ಟೇಟಸ್/u],
+  ['log_attendance', /ಹಾಜರಿ|ಸೆಲ್ಫಿ/u],
+  ['help', /ಸಹಾಯ|ಹೆಲ್ಪ್/u],
+  ['greeting', /ನಮಸ್ಕಾರ|ಹಲೋ/u],
+];
+
 async function detectIntent(text, language) {
   const lower = (text || '').toLowerCase();
 
@@ -586,11 +799,13 @@ async function detectIntent(text, language) {
     return { type: 'demo_certificate', confidence: 99, source: 'keyword', transcript: text };
   }
 
-  if (/\b(progress|status|kitne din|days|din|kaisa|update)\b/.test(lower)) {
-    return { type: 'check_progress', confidence: 95, source: 'keyword', transcript: text };
-  }
+  // Certificate before progress: "certificate status" / "certificate kab milega" is about the certificate
   if (/\b(certificate|praman|patra|download|sanad)\b/.test(lower)) {
     return { type: 'request_certificate', confidence: 95, source: 'keyword', transcript: text };
+  }
+  // Only explicit day-count phrases: a bare "din" ("aaj ka din accha tha") is not a progress query
+  if (/\b(progress|status|update|kitne din|din kitne|how many days|(?:days|din) (?:left|remaining|baaki|baki|bache|hue|logged))\b/.test(lower)) {
+    return { type: 'check_progress', confidence: 95, source: 'keyword', transcript: text };
   }
   if (/\b(attendance|haziri|check.?in|selfie|log)\b/.test(lower)) {
     return { type: 'log_attendance', confidence: 90, source: 'keyword', transcript: text };
@@ -600,6 +815,12 @@ async function detectIntent(text, language) {
   }
   if (/\b(hello|hi|namaskar|namaste|good morning|suprabhat)\b/.test(lower)) {
     return { type: 'greeting', confidence: 95, source: 'keyword', transcript: text };
+  }
+
+  // Kannada-script keywords (\b does not work next to non-ASCII letters)
+  const kannada = KANNADA_INTENT_KEYWORDS.find(([, re]) => re.test(text || ''));
+  if (kannada) {
+    return { type: kannada[0], confidence: 90, source: 'keyword', transcript: text };
   }
 
   // Layer 1: Lex V2 — structured intent recognition (if bot is configured)
@@ -649,7 +870,7 @@ async function detectIntent(text, language) {
     const prompt = `You are the voice assistant for Nirman Mitra, a construction worker welfare platform. A worker sent a voice message. Classify their intent.
 
 Worker said: "${text}"
-Language: ${language === 'hi' ? 'Hindi' : 'English'}
+Language: ${languageName(language)}
 
 Possible intents:
 - check_progress: Worker wants to know how many days logged, remaining days, or percentage
@@ -707,13 +928,11 @@ async function executeIntent(intent, workerId, worker, phoneNumber, language) {
 
   switch (intent.type) {
     case 'demo_fail': {
-      // Create a low-confidence attendance entry for review queue demo
-      const logDate = new Date().toISOString().split('T')[0];
+      // Create a low-confidence attendance entry for review queue demo. It goes on the most recent
+      // IST date without a log (conditional write), so a real log is never overwritten.
       const timestamp = new Date().toISOString();
-      const { putItem } = await import('../utils/dynamodb.js');
-      await putItem(config.tables.attendance, {
+      const demoLog = {
         worker_id: workerId,
-        log_date: logDate,
         timestamp,
         site_id: 'SITE-DEMO-001',
         site_name: 'Greenfield Metro Station',
@@ -727,25 +946,37 @@ async function executeIntent(intent, workerId, worker, phoneNumber, language) {
         flagged_reason: 'Low face confidence: 48% | Voice note not work-related',
         is_off_hours: false,
         created_at: timestamp,
+      };
+      let logDate = null;
+      for (let daysAgo = 0; daysAgo < 30 && !logDate; daysAgo++) {
+        const date = istDate(Date.now() - daysAgo * 86400000);
+        const written = await putItemIfAbsent(
+          config.tables.attendance,
+          { ...demoLog, log_date: date },
+          { worker_id: workerId, log_date: date },
+        );
+        if (written) logDate = date;
+      }
+      const responseText = t(language, {
+        en: 'Attendance submitted for admin review due to low confidence. Check the admin dashboard review queue.',
+        hi: 'Attendance admin review ke liye bhej di gayi — confidence kam thi. Admin dashboard pe review queue dekhiye.',
+        kn: KN.demoFail,
       });
-      const responseText = language === 'en'
-        ? 'Attendance submitted for admin review due to low confidence. Check the admin dashboard review queue.'
-        : 'Attendance admin review ke liye bhej di gayi — confidence kam thi. Admin dashboard pe review queue dekhiye.';
       await sendTextMessage(phoneNumber, responseText);
-      return apiResponse(200, { status: 'demo_fail_created', workerId });
+      return apiResponse(200, { status: 'demo_fail_created', workerId, logDate });
     }
 
     case 'demo_certificate': {
       // Fast-track certificate for demo: eligibility counts verified logs, so fill past dates that
       // have no log yet with approved demo logs (real logs are never overwritten), then generate
-      const { updateItem, putItem, queryItems } = await import('../utils/dynamodb.js');
+      const { putItem } = await import('../utils/dynamodb.js');
       const existingLogs = await queryItems(config.tables.attendance, 'worker_id = :wid', { ':wid': workerId });
       const takenDates = new Set(existingLogs.map((l) => l.log_date));
       let verified = existingLogs.filter(
         (l) => l.verification_status === 'auto_approved' || l.verification_status === 'approved',
       ).length;
       for (let daysAgo = 1; verified < config.certificateThreshold; daysAgo++) {
-        const logDate = new Date(Date.now() - daysAgo * 86400000).toISOString().split('T')[0];
+        const logDate = istDate(Date.now() - daysAgo * 86400000);
         if (takenDates.has(logDate)) continue;
         await putItem(config.tables.attendance, {
           worker_id: workerId,
@@ -765,27 +996,39 @@ async function executeIntent(intent, workerId, worker, phoneNumber, language) {
         'SET total_days_logged = :days',
         { ':days': verified },
       );
-      const certText = language === 'en'
-        ? `Demo mode: Set your days to ${config.certificateThreshold}. Generating certificate now...`
-        : `Demo mode: Aapke din ${config.certificateThreshold} set kiye. Certificate bana rahe hain...`;
+      const certText = t(language, {
+        en: `Demo mode: Set your days to ${config.certificateThreshold}. Generating certificate now...`,
+        hi: `Demo mode: Aapke din ${config.certificateThreshold} set kiye. Certificate bana rahe hain...`,
+        kn: KN.demoCertificate(config.certificateThreshold),
+      });
       await sendTextMessage(phoneNumber, certText);
       await triggerCertificateGeneration(workerId, phoneNumber, language);
       return apiResponse(200, { status: 'demo_certificate_triggered', workerId });
     }
 
     case 'check_progress': {
-      const responseText = language === 'en'
-        ? `${name}, you have logged ${daysLogged} of ${threshold} days (${pct}%). ${daysRemaining > 0 ? `${daysRemaining} days remaining.` : 'You are eligible for your certificate!'}`
-        : `${name}, aapne ${threshold} mein se ${daysLogged} din log kiye hain (${pct}%). ${daysRemaining > 0 ? `${daysRemaining} din aur baaki hain.` : 'Aap certificate ke liye eligible hain!'}`;
+      const responseText = t(language, {
+        en: `${name}, you have logged ${daysLogged} of ${threshold} days (${pct}%). ${daysRemaining > 0 ? `${daysRemaining} days remaining.` : 'You are eligible for your certificate!'}`,
+        hi: `${name}, aapne ${threshold} mein se ${daysLogged} din log kiye hain (${pct}%). ${daysRemaining > 0 ? `${daysRemaining} din aur baaki hain.` : 'Aap certificate ke liye eligible hain!'}`,
+        kn: KN.progress(name, daysLogged, threshold, pct, daysRemaining),
+      });
       await sendTextAndVoice(phoneNumber, workerId, responseText, language, 'progress');
       return apiResponse(200, { status: 'progress_sent', workerId, intent: intent.type, daysLogged, daysRemaining });
     }
 
     case 'request_certificate': {
+      // Asking again after the certificate was issued re-sends the same PDF
+      const existingCert = await findLatestCertificate(workerId);
+      if (existingCert) {
+        await sendCertificateDocument(phoneNumber, existingCert, language);
+        return apiResponse(200, { status: 'certificate_resent', workerId, intent: intent.type });
+      }
       if (daysLogged < threshold) {
-        const responseText = language === 'en'
-          ? `${name}, you need ${daysRemaining} more days to be eligible for a certificate. Keep logging attendance daily!`
-          : `${name}, certificate ke liye ${daysRemaining} din aur chahiye. Har din attendance log karte rahiye!`;
+        const responseText = t(language, {
+          en: `${name}, you need ${daysRemaining} more days to be eligible for a certificate. Keep logging attendance daily!`,
+          hi: `${name}, certificate ke liye ${daysRemaining} din aur chahiye. Har din attendance log karte rahiye!`,
+          kn: KN.certificateNotReady(name, daysRemaining),
+        });
         await sendTextAndVoice(phoneNumber, workerId, responseText, language, 'cert-not-ready');
         return apiResponse(200, { status: 'certificate_not_eligible', workerId, intent: intent.type });
       }
@@ -795,26 +1038,32 @@ async function executeIntent(intent, workerId, worker, phoneNumber, language) {
     }
 
     case 'log_attendance': {
-      const responseText = language === 'en'
-        ? 'To log attendance:\n1. Send a selfie photo\n2. Share your location (tap the button)\n3. Send a voice note about your work\n\nStart by sending a selfie!'
-        : 'Attendance ke liye:\n1. Selfie photo bhejiye\n2. Location share karein (button dabayein)\n3. Kaam ka voice note bhejiye\n\nPehle selfie bhejiye!';
+      const responseText = t(language, {
+        en: 'To log attendance:\n1. Send a selfie photo\n2. Share your location (tap the button)\n3. Send a voice note about your work\n\nStart by sending a selfie!',
+        hi: 'Attendance ke liye:\n1. Selfie photo bhejiye\n2. Location share karein (button dabayein)\n3. Kaam ka voice note bhejiye\n\nPehle selfie bhejiye!',
+        kn: KN.logAttendanceGuide,
+      });
       await sendTextAndVoice(phoneNumber, workerId, responseText, language, 'attendance-guide');
       return apiResponse(200, { status: 'attendance_guidance_sent', workerId, intent: intent.type });
     }
 
     case 'greeting': {
-      const responseText = language === 'en'
-        ? `Hello ${name}! I am Nirman Mitra, your digital work companion. You have ${daysLogged} days logged. Send a selfie to log attendance, or ask me about your progress.`
-        : `Namaskar ${name}! Main Nirman Mitra hoon, aapka digital saathi. Aapke ${daysLogged} din log hain. Attendance ke liye selfie bhejiye, ya apna progress poochiye.`;
+      const responseText = t(language, {
+        en: `Hello ${name}! I am Nirman Mitra, your digital work companion. You have ${daysLogged} days logged. Send a selfie to log attendance, or ask me about your progress.`,
+        hi: `Namaskar ${name}! Main Nirman Mitra hoon, aapka digital saathi. Aapke ${daysLogged} din log hain. Attendance ke liye selfie bhejiye, ya apna progress poochiye.`,
+        kn: KN.greetingActive(name, daysLogged),
+      });
       await sendTextAndVoice(phoneNumber, workerId, responseText, language, 'greeting');
       return apiResponse(200, { status: 'greeting_sent', workerId, intent: intent.type });
     }
 
     case 'help':
     default: {
-      const responseText = language === 'en'
-        ? `${name}, here is what I can do:\n• Send a selfie + voice note → Log attendance\n• Say "progress" → Check your days\n• Say "certificate" → Request certificate\n\nYou have ${daysLogged} days logged, ${daysRemaining} remaining.`
-        : `${name}, main yeh kar sakta hoon:\n• Selfie + voice note bhejiye → Attendance log\n• "Progress" boliye → Apne din dekhiye\n• "Certificate" boliye → Certificate maangiye\n\nAapke ${daysLogged} din log hain, ${daysRemaining} baaki.`;
+      const responseText = t(language, {
+        en: `${name}, here is what I can do:\n• Send a selfie + voice note → Log attendance\n• Say "progress" → Check your days\n• Say "certificate" → Request certificate\n\nYou have ${daysLogged} days logged, ${daysRemaining} remaining.`,
+        hi: `${name}, main yeh kar sakta hoon:\n• Selfie + voice note bhejiye → Attendance log\n• "Progress" boliye → Apne din dekhiye\n• "Certificate" boliye → Certificate maangiye\n\nAapke ${daysLogged} din log hain, ${daysRemaining} baaki.`,
+        kn: KN.help(name, daysLogged, daysRemaining),
+      });
       await sendTextAndVoice(phoneNumber, workerId, responseText, language, 'help');
       return apiResponse(200, { status: 'help_sent', workerId, intent: intent.type });
     }
@@ -863,9 +1112,11 @@ async function handleSelfiePendingLocation(workerId, worker, message, language) 
     });
 
     // Send location request button
-    const locationText = language === 'en'
-      ? 'Selfie received! Now share your location to complete attendance. Tap the button below.'
-      : 'Selfie mil gaya! Ab apna location share karein attendance poora karne ke liye. Neeche button dabayein.';
+    const locationText = t(language, {
+      en: 'Selfie received! Now share your location to complete attendance. Tap the button below.',
+      hi: 'Selfie mil gaya! Ab apna location share karein attendance poora karne ke liye. Neeche button dabayein.',
+      kn: KN.checkinLocationButton,
+    });
 
     try {
       await sendLocationRequest(phoneNumber, locationText);
@@ -879,18 +1130,22 @@ async function handleSelfiePendingLocation(workerId, worker, message, language) 
         pending_longitude: null,
         preferred_language: language,
       });
-      const voiceText = language === 'en'
-        ? 'Selfie received! Hold the mic button and tell us:\n• What work did you do today?\n• Which floor or area?\n\nExample: "Today I did painting work on 3rd floor"\n\nOr send "ok" to skip.'
-        : 'Selfie mil gaya! Mic button dabake bataiye:\n• Aaj kya kaam kiya?\n• Kaun si jagah pe?\n\nJaise: "Aaj maine 3rd floor pe painting ka kaam kiya"\n\nYa "ok" bhejiye skip karne ke liye.';
+      const voiceText = t(language, {
+        en: 'Selfie received! Hold the mic button and tell us:\n• What work did you do today?\n• Which floor or area?\n\nExample: "Today I did painting work on 3rd floor"\n\nOr send "ok" to skip.',
+        hi: 'Selfie mil gaya! Mic button dabake bataiye:\n• Aaj kya kaam kiya?\n• Kaun si jagah pe?\n\nJaise: "Aaj maine 3rd floor pe painting ka kaam kiya"\n\nYa "ok" bhejiye skip karne ke liye.',
+        kn: KN.voiceAskAfterSelfie,
+      });
       await sendTextMessage(phoneNumber, voiceText);
     }
 
     return apiResponse(200, { status: 'selfie_stored_awaiting_location', workerId });
   } catch (err) {
     console.error('Selfie pending location error:', err);
-    await sendTextMessage(phoneNumber, language === 'en'
-      ? 'Something went wrong. Please try sending your selfie again.'
-      : 'Kuch problem ho gayi. Kripya dobara selfie bhejiye.');
+    await sendTextMessage(phoneNumber, t(language, {
+      en: 'Something went wrong. Please try sending your selfie again.',
+      hi: 'Kuch problem ho gayi. Kripya dobara selfie bhejiye.',
+      kn: KN.selfieErrorRetry,
+    }));
     return apiResponse(200, { status: 'error', workerId, error: err.message });
   }
 }
@@ -935,34 +1190,51 @@ async function processFullAttendance(workerId, worker, language, state, voiceTra
       language,
     });
 
-    // Send response
+    // Reply with text + Polly voice, always including days logged / remaining
+    const daysLogged = decision.totalDaysLogged ?? (worker.total_days_logged || 0);
+    const daysRemaining = Math.max(0, decision.daysRemaining ?? (config.certificateThreshold - daysLogged));
+    const progress = t(language, {
+      en: ` ${daysLogged} days logged, ${daysRemaining} days remaining.`,
+      hi: ` ${daysLogged} din log hue, ${daysRemaining} din aur baaki.`,
+      kn: KN.progressSuffix(daysLogged, daysRemaining),
+    });
+
     let responseText;
+    let label;
     if (decision.status === 'duplicate') {
-      responseText = language === 'en'
-        ? 'Your attendance is already logged for today.'
-        : 'Aapki aaj ki attendance pehle se log ho chuki hai.';
+      label = 'attendance-duplicate';
+      responseText = t(language, {
+        en: 'Your attendance is already logged for today.',
+        hi: 'Aapki aaj ki attendance pehle se log ho chuki hai.',
+        kn: KN.attendanceDuplicate,
+      }) + progress;
     } else if (decision.status === 'auto_approved') {
-      responseText = language === 'en'
-        ? `Attendance verified! Day ${decision.totalDaysLogged} logged. ${decision.daysRemaining} days remaining.${decision.certificateEligible ? ' Certificate eligible!' : ''}`
-        : `Attendance verified! Din ${decision.totalDaysLogged} log hua. ${decision.daysRemaining} din aur baaki.${decision.certificateEligible ? ' Certificate ke liye eligible!' : ''}`;
+      label = 'attendance-confirmed';
+      responseText = t(language, {
+        en: `Attendance verified! Day ${daysLogged} logged. ${daysRemaining} days remaining.${decision.certificateEligible ? ' Certificate eligible!' : ''}`,
+        hi: `Attendance verified! Din ${daysLogged} log hua. ${daysRemaining} din aur baaki.${decision.certificateEligible ? ' Certificate ke liye eligible!' : ''}`,
+        kn: KN.attendanceVerified(daysLogged, daysRemaining, decision.certificateEligible),
+      });
     } else if (decision.status === 'pending_review') {
-      responseText = language === 'en'
-        ? 'Attendance submitted for admin review. You will be notified once reviewed.'
-        : 'Attendance admin review ke liye bhej di gayi hai. Review hone par aapko bataya jayega.';
+      label = 'attendance-pending';
+      responseText = t(language, {
+        en: 'Attendance submitted for admin review. You will be notified once reviewed.',
+        hi: 'Attendance admin review ke liye bhej di gayi hai. Review hone par aapko bataya jayega.',
+        kn: KN.attendancePending,
+      }) + progress;
     } else {
-      responseText = language === 'en'
-        ? 'Attendance could not be verified. Please try again.'
-        : 'Attendance verify nahi ho saki. Kripya dobara koshish karein.';
+      label = 'attendance-rejected';
+      responseText = t(language, {
+        en: 'Attendance could not be verified. Please try again.',
+        hi: 'Attendance verify nahi ho saki. Kripya dobara koshish karein.',
+        kn: KN.attendanceRejected,
+      }) + progress;
     }
 
-    await sendTextMessage(phoneNumber, responseText);
+    await sendTextAndVoice(phoneNumber, workerId, responseText, language, label);
 
-    if (decision.status === 'auto_approved') {
-      const audioUrl = await generateAndUploadVoice(workerId, responseText, language, 'attendance-confirmed');
-      if (audioUrl) await sendAudioMessage(phoneNumber, audioUrl);
-      if (decision.certificateEligible) {
-        await triggerCertificateGeneration(workerId, phoneNumber, language);
-      }
+    if (decision.status === 'auto_approved' && decision.certificateEligible) {
+      await triggerCertificateGeneration(workerId, phoneNumber, language);
     }
 
     return apiResponse(200, {
@@ -975,102 +1247,11 @@ async function processFullAttendance(workerId, worker, language, state, voiceTra
     });
   } catch (err) {
     console.error('Full attendance processing error:', err);
-    await sendTextMessage(phoneNumber, language === 'en'
-      ? 'Something went wrong with attendance. Please try again.'
-      : 'Attendance mein kuch problem ho gayi. Kripya dobara koshish karein.');
-    return apiResponse(200, { status: 'error', workerId, error: err.message });
-  }
-}
-
-// ─────────────────────────────────────────────────────────
-// Fallback: Attendance without location (dev mode / location request unsupported)
-// ─────────────────────────────────────────────────────────
-
-async function handleAttendanceCheckIn(workerId, worker, message, language) {
-  const phoneNumber = message.from;
-
-  try {
-    // Step 1: Download and upload selfie to S3
-    const media = await downloadMedia(message.mediaId);
-    const uploadResult = await uploadWorkerMedia(workerId, 'checkin-selfie', media.buffer, 'image/jpeg');
-
-    // Step 2: Extract voice transcription from caption (if present)
-    // In real usage, worker sends image with voice note caption or separate audio
-    const voiceTranscription = message.caption || '';
-
-    // Step 3: Extract GPS (from message location or demo defaults)
-    const latitude = message.latitude || (isDemoMode() ? 28.6139 : null);
-    const longitude = message.longitude || (isDemoMode() ? 77.2090 : null);
-
-    // Step 4: Run Triple Verification locally (in production, Step Functions orchestrates this)
-    // Run face + geo in parallel, then voice, then merge
-    const [faceResult, geoResult, voiceResult] = await Promise.all([
-      attendanceHandler({ task: 'face_verify', workerId, selfieKey: uploadResult.key, bucket: config.buckets.mediaRaw }),
-      attendanceHandler({ task: 'geo_verify', workerId, latitude, longitude }),
-      attendanceHandler({ task: 'voice_verify', workerId, voiceTranscription: voiceTranscription || 'construction work at site', language }),
-    ]);
-
-    // Step 5: Merge and decide
-    const decision = await attendanceHandler({
-      task: 'merge_decision',
-      workerId,
-      faceResult,
-      geoResult,
-      voiceResult,
-      language,
-    });
-
-    // Step 6: Send appropriate response
-    let responseText;
-
-    if (decision.status === 'duplicate') {
-      responseText = language === 'en'
-        ? 'Your attendance is already logged for today.'
-        : 'Aapki aaj ki attendance pehle se log ho chuki hai.';
-    } else if (decision.status === 'auto_approved') {
-      responseText = language === 'en'
-        ? `Attendance verified! Day ${decision.totalDaysLogged} logged. ${decision.daysRemaining} days remaining.${decision.certificateEligible ? ' Certificate eligible!' : ''}`
-        : `Attendance verified! Din ${decision.totalDaysLogged} log hua. ${decision.daysRemaining} din aur baaki.${decision.certificateEligible ? ' Certificate ke liye eligible!' : ''}`;
-    } else if (decision.status === 'pending_review') {
-      responseText = language === 'en'
-        ? 'Attendance submitted for admin review. You will be notified once reviewed.'
-        : 'Attendance admin review ke liye bhej di gayi hai. Review hone par aapko bataya jayega.';
-    } else {
-      responseText = language === 'en'
-        ? 'Attendance could not be verified. Please send a clearer selfie and voice note.'
-        : 'Attendance verify nahi ho saki. Kripya clear selfie aur voice note dobara bhejiye.';
-    }
-
-    await sendTextMessage(phoneNumber, responseText);
-
-    // Generate voice confirmation for approved
-    if (decision.status === 'auto_approved') {
-      const audioUrl = await generateAndUploadVoice(workerId, responseText, language, 'attendance-confirmed');
-      if (audioUrl) {
-        await sendAudioMessage(phoneNumber, audioUrl);
-      }
-
-      // Check if worker is now eligible for certificate
-      if (decision.certificateEligible) {
-        await triggerCertificateGeneration(workerId, phoneNumber, language);
-      }
-    }
-
-    return apiResponse(200, {
-      status: 'attendance_processed',
-      workerId,
-      verificationStatus: decision.status,
-      confidence: decision.confidence,
-      daysLogged: decision.totalDaysLogged,
-      daysRemaining: decision.daysRemaining,
-      certificateEligible: decision.certificateEligible || false,
-    });
-  } catch (err) {
-    console.error('Attendance check-in error:', err);
-    const errorText = language === 'en'
-      ? 'Something went wrong with attendance. Please try again.'
-      : 'Attendance mein kuch problem ho gayi. Kripya dobara koshish karein.';
-    await sendTextMessage(phoneNumber, errorText);
+    await sendTextMessage(phoneNumber, t(language, {
+      en: 'Something went wrong with attendance. Please try again.',
+      hi: 'Attendance mein kuch problem ho gayi. Kripya dobara koshish karein.',
+      kn: KN.attendanceError,
+    }));
     return apiResponse(200, { status: 'error', workerId, error: err.message });
   }
 }
@@ -1086,18 +1267,43 @@ async function triggerCertificateGeneration(workerId, phoneNumber, language) {
     const result = await certificateHandler({ task: 'generate', workerId, language });
 
     if (result.success) {
-      const certText = language === 'en'
-        ? `Congratulations! Your Smart Certificate is ready! BOCW Ref: ${result.bocwReference}. Download: ${result.downloadUrl}`
-        : `Badhai ho! Aapka Smart Certificate taiyar hai! BOCW Ref: ${result.bocwReference}. Download: ${result.downloadUrl}`;
-      await sendTextMessage(phoneNumber, certText);
-
-      const audioUrl = await generateAndUploadVoice(workerId, certText, language, 'certificate-ready');
-      if (audioUrl) {
-        await sendAudioMessage(phoneNumber, audioUrl);
-      }
+      const certText = t(language, {
+        en: `Congratulations! Your Smart Certificate is ready! BOCW Ref: ${result.bocwReference}. The certificate PDF is attached below.`,
+        hi: `Badhai ho! Aapka Smart Certificate taiyar hai! BOCW Ref: ${result.bocwReference}. Certificate ka PDF neeche bheja gaya hai.`,
+        kn: KN.certificateReady(result.bocwReference),
+      });
+      await sendTextAndVoice(phoneNumber, workerId, certText, language, 'certificate-ready');
+      await sendCertificateDocument(phoneNumber, {
+        certificate_id: result.certificateId,
+        bocw_reference: result.bocwReference,
+        pdf_s3_key: result.pdfS3Key,
+      }, language);
+    } else {
+      console.log(`Certificate not generated for ${workerId}: ${result.reason || result.error}`);
     }
   } catch (err) {
     console.error('Certificate generation failed:', err.message);
     // Non-blocking: attendance is already logged, certificate can be retried
   }
+}
+
+/** Most recently issued certificate of a worker, or null */
+async function findLatestCertificate(workerId) {
+  const certs = await queryItems(config.tables.certificates, 'worker_id = :wid', { ':wid': workerId });
+  const issued = certs.filter((c) => c.pdf_s3_key);
+  issued.sort((a, b) => String(b.created_at || '').localeCompare(String(a.created_at || '')));
+  return issued[0] || null;
+}
+
+/**
+ * Send a certificate PDF as a WhatsApp document. The pre-signed link is created right before
+ * sending (WhatsApp fetches it immediately), so no long-lived link is ever handed out.
+ */
+async function sendCertificateDocument(phoneNumber, cert, language = 'hi') {
+  const url = await generatePresignedUrl(config.buckets.certificates, cert.pdf_s3_key, 900);
+  const caption = t(language, {
+    hi: `Nirman Mitra Smart Certificate${cert.bocw_reference ? ` (BOCW Ref: ${cert.bocw_reference})` : ''}`,
+    kn: KN.certificateCaption(cert.bocw_reference),
+  });
+  await sendDocumentMessage(phoneNumber, url, `Nirman-Mitra-Certificate-${cert.certificate_id}.pdf`, caption);
 }

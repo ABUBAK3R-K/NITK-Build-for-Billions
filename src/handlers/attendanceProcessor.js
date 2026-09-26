@@ -13,21 +13,23 @@
 import {
   RekognitionClient,
   CompareFacesCommand,
-  DetectFacesCommand,
 } from '@aws-sdk/client-rekognition';
-import config, { isDemoMode } from '../utils/config.js';
+import config, { isDemoMode, istDate } from '../utils/config.js';
 import {
   getItem,
-  putItem,
-  updateItem,
   queryItems,
   incrementDaysLogged,
 } from '../utils/dynamodb.js';
-import { downloadFromS3 } from '../utils/s3.js';
+import { downloadFromS3, uploadToS3, enrolledSelfieKey } from '../utils/s3.js';
+import { putItemIfAbsent } from '../services/conditionalWrite.js';
 import { complete } from '../providers/llm.js';
 import { withRetry } from '../utils/retryHelper.js';
+import { languageName } from '../utils/i18n.js';
 
 const rekognitionClient = new RekognitionClient({ region: config.aws.region });
+
+/** Pre-migration location of the reference selfie (expires with the rest of workers/) */
+const legacyEnrolledSelfieKey = (workerId) => `workers/${workerId}/selfie-latest.jpg`;
 
 export const handler = async (event) => {
   console.log('AttendanceProcessor event:', JSON.stringify(event).substring(0, 500));
@@ -86,27 +88,49 @@ async function processFaceVerification(event) {
     selfieKey,
   );
 
-  // Compare against enrolled face (stored during registration)
-  // We use the worker's registration selfie from S3 as the source
-  const enrolledKey = `workers/${workerId}/selfie-latest.jpg`;
+  // Compare against the enrolled reference selfie stored during registration; workers enrolled
+  // before the enrolled/ prefix existed still have it at the legacy key
   let enrolledBuffer;
   try {
-    enrolledBuffer = await downloadFromS3(config.buckets.mediaRaw, enrolledKey);
+    enrolledBuffer = await downloadFromS3(config.buckets.mediaRaw, enrolledSelfieKey(workerId));
   } catch {
-    return { success: false, confidence: 0, reason: 'enrolled_selfie_not_found' };
+    try {
+      enrolledBuffer = await downloadFromS3(config.buckets.mediaRaw, legacyEnrolledSelfieKey(workerId));
+    } catch {
+      return { success: false, confidence: 0, reason: 'enrolled_selfie_not_found' };
+    }
+    // The legacy key expires with the rest of workers/ media, so keep a permanent copy
+    try {
+      await uploadToS3(config.buckets.mediaRaw, enrolledSelfieKey(workerId), enrolledBuffer, 'image/jpeg', {
+        worker_id: workerId,
+        media_type: 'enrolled-selfie',
+      });
+    } catch (err) {
+      console.warn('[AttendanceProcessor] Could not copy legacy enrolled selfie:', err.message);
+    }
   }
 
-  const compareResult = await withRetry(
-    () => rekognitionClient.send(
-      new CompareFacesCommand({
-        SourceImage: { Bytes: enrolledBuffer },
-        TargetImage: { Bytes: selfieBuffer },
-        SimilarityThreshold: 50,
-        QualityFilter: 'AUTO',
-      }),
-    ),
-    { label: 'Rekognition:CompareFaces' },
-  );
+  let compareResult;
+  try {
+    compareResult = await withRetry(
+      () => rekognitionClient.send(
+        new CompareFacesCommand({
+          SourceImage: { Bytes: enrolledBuffer },
+          TargetImage: { Bytes: selfieBuffer },
+          // Return every match: similarity 30-59 must route to review, not look like "no match"
+          SimilarityThreshold: 0,
+          QualityFilter: 'AUTO',
+        }),
+      ),
+      { label: 'Rekognition:CompareFaces' },
+    );
+  } catch (err) {
+    // Rekognition rejects images in which it finds no face with InvalidParameterException
+    if (err.name === 'InvalidParameterException') {
+      return { success: false, confidence: 0, faceMatch: false, reason: 'no_face' };
+    }
+    throw err;
+  }
 
   const match = compareResult.FaceMatches?.[0];
   if (!match) {
@@ -119,9 +143,10 @@ async function processFaceVerification(event) {
     };
   }
 
+  // Unrounded, so routing thresholds are compared exactly (59.5 is below 60)
   return {
     success: true,
-    confidence: Math.round(match.Similarity),
+    confidence: match.Similarity,
     faceMatch: true,
     details: {
       similarity: Math.round(match.Similarity),
@@ -136,7 +161,7 @@ async function processFaceVerification(event) {
 // ---------------------------------------------------------
 
 async function processGeoVerification(event) {
-  const { workerId, latitude, longitude } = event;
+  const { latitude, longitude } = event;
 
   if (!latitude || !longitude) {
     // In dev mode, auto-pass geo verification if no GPS data (WhatsApp strips EXIF)
@@ -177,9 +202,11 @@ async function processGeoVerification(event) {
     return { success: false, confidence: 0, reason: 'no_active_sites', distance: null };
   }
 
-  // Find nearest site within radius
+  // Pick the site with the smallest distance / radius ratio: a site whose fence contains the
+  // point (ratio <= 1) always wins over a closer site whose smaller fence does not
   let nearestSite = null;
   let minDistance = Infinity;
+  let minRatio = Infinity;
 
   for (const site of sites) {
     const siteLat = site.geo_location?.latitude;
@@ -187,7 +214,9 @@ async function processGeoVerification(event) {
     if (!siteLat || !siteLng) continue;
 
     const distance = haversineDistance(latitude, longitude, siteLat, siteLng);
-    if (distance < minDistance) {
+    const ratio = distance / (site.radius_meters || 500);
+    if (ratio < minRatio) {
+      minRatio = ratio;
       minDistance = distance;
       nearestSite = site;
     }
@@ -200,14 +229,15 @@ async function processGeoVerification(event) {
   const siteRadius = nearestSite.radius_meters || 500;
   const withinRadius = minDistance <= siteRadius;
 
-  // Confidence based on distance: 100% at center, decreasing as you approach boundary
+  // Confidence based on distance: 100% at center, decreasing as you approach boundary.
+  // Outside the fence stays below 60, so it can never auto-approve.
   let confidence;
   if (minDistance <= siteRadius * 0.5) {
     confidence = 95; // Well within
   } else if (minDistance <= siteRadius) {
     confidence = 80; // Within but near edge
   } else if (minDistance <= siteRadius * 1.2) {
-    confidence = 65; // Slightly outside (review range)
+    confidence = 50; // Slightly outside (review range)
   } else {
     confidence = 30; // Clearly outside
   }
@@ -216,7 +246,8 @@ async function processGeoVerification(event) {
     success: withinRadius,
     confidence,
     withinRadius,
-    distance: Math.round(minDistance),
+    // Unrounded, so the 2x-radius rejection is compared exactly
+    distance: minDistance,
     nearestSite: {
       site_id: nearestSite.site_id,
       name: nearestSite.site_name || nearestSite.site_id,
@@ -230,7 +261,7 @@ async function processGeoVerification(event) {
 // ---------------------------------------------------------
 
 async function processVoiceVerification(event) {
-  const { workerId, voiceTranscription, language } = event;
+  const { voiceTranscription, language } = event;
 
   if (!voiceTranscription || voiceTranscription.length < 3) {
     return { success: false, confidence: 0, reason: 'no_voice_data', workDetails: null };
@@ -249,7 +280,7 @@ async function processVoiceVerification(event) {
     };
   }
 
-  const prompt = `You are analyzing a voice note from an Indian construction worker who is logging their daily attendance. The worker described their work in ${language === 'en' ? 'English' : 'Hindi'}.
+  const prompt = `You are analyzing a voice note from an Indian construction worker who is logging their daily attendance. The worker described their work in ${languageName(language)}.
 
 Worker's voice transcription: "${voiceTranscription}"
 
@@ -266,14 +297,16 @@ Respond in EXACTLY this JSON format (no markdown, no code blocks):
     const response = await complete({ prompt, json: true, maxTokens: 200, cacheTtlSeconds: 86400 });
     const jsonStr = response.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
     const result = JSON.parse(jsonStr);
+    // The model sometimes answers "false" as a string, which Boolean() would read as true
+    const isWorkRelated = result.is_work_related === true || String(result.is_work_related).toLowerCase() === 'true';
 
     return {
-      success: Boolean(result.is_work_related),
+      success: isWorkRelated,
       confidence: Math.min(100, Math.max(0, Number(result.confidence) || 0)),
       workDetails: {
         activity: String(result.activity || ''),
         location_mention: result.location_mention || null,
-        is_work_related: Boolean(result.is_work_related),
+        is_work_related: isWorkRelated,
       },
     };
   } catch (err) {
@@ -293,33 +326,43 @@ Respond in EXACTLY this JSON format (no markdown, no code blocks):
 // ---------------------------------------------------------
 
 async function processMergeDecision(event) {
-  const { workerId, faceResult, geoResult, voiceResult, language } = event;
+  const { workerId, faceResult, geoResult, voiceResult } = event;
 
   const worker = await getItem(config.tables.workers, { worker_id: workerId });
   if (!worker) {
     return { statusCode: 404, error: 'Worker not found' };
   }
 
-  const logDate = new Date().toISOString().split('T')[0];
+  // Attendance days are IST calendar days (UTC+5:30), as is off-hours detection
+  const logDate = istDate();
   const timestamp = new Date().toISOString();
-  // Use IST (UTC+5:30) for off-hours detection
   const currentHour = new Date(Date.now() + 5.5 * 60 * 60 * 1000).getUTCHours();
+  const threshold = config.certificateThreshold;
 
-  // Check for duplicate (same worker + same date)
+  const duplicate = (existingStatus) => {
+    const days = worker.total_days_logged || 0;
+    return {
+      status: 'duplicate',
+      message: 'Attendance already logged for today',
+      existingStatus,
+      totalDaysLogged: days,
+      daysRemaining: Math.max(0, threshold - days),
+      threshold,
+    };
+  };
+
+  // Fast path for the common duplicate; the conditional write below is what actually
+  // guarantees one log per day when two check-ins race
   const existingLog = await getItem(config.tables.attendance, {
     worker_id: workerId,
     log_date: logDate,
   });
 
   if (existingLog && existingLog.verification_status !== 'rejected') {
-    return {
-      status: 'duplicate',
-      message: 'Attendance already logged for today',
-      existingStatus: existingLog.verification_status,
-    };
+    return duplicate(existingLog.verification_status);
   }
 
-  // Extract confidence scores
+  // Extract confidence scores (unrounded; rounded only when stored)
   const faceConfidence = faceResult?.confidence || 0;
   const geoConfidence = geoResult?.confidence || 0;
   const voiceConfidence = voiceResult?.confidence || 0;
@@ -335,20 +378,22 @@ async function processMergeDecision(event) {
   let flaggedReasons = [];
 
   // Face rules
-  if (faceConfidence < 60) {
-    flaggedReasons.push(`Low face confidence: ${faceConfidence}%`);
+  if (faceResult?.reason === 'no_face') {
+    flaggedReasons.push('No face found in selfie');
+  } else if (faceConfidence < 60) {
+    flaggedReasons.push(`Low face confidence: ${Math.round(faceConfidence)}%`);
   } else if (faceConfidence < 80) {
-    flaggedReasons.push(`Face confidence in review range: ${faceConfidence}%`);
+    flaggedReasons.push(`Face confidence in review range: ${Math.round(faceConfidence)}%`);
   }
 
   // GPS rules
-  const distance = geoResult?.distance;
-  if (distance !== null && distance !== undefined) {
+  const distance = geoResult?.distance ?? null;
+  if (distance !== null) {
     const siteRadius = geoResult?.nearestSite?.radius || 500;
     if (distance > siteRadius) {
-      flaggedReasons.push(`GPS outside radius: ${distance}m (limit: ${siteRadius}m)`);
+      flaggedReasons.push(`GPS outside radius: ${Math.round(distance)}m (limit: ${siteRadius}m)`);
     } else if (distance > siteRadius * 0.5) {
-      flaggedReasons.push(`GPS near boundary: ${distance}m`);
+      flaggedReasons.push(`GPS near boundary: ${Math.round(distance)}m`);
     }
   } else if (!geoResult?.success) {
     flaggedReasons.push('No GPS data available');
@@ -386,21 +431,29 @@ async function processMergeDecision(event) {
     site_name: geoResult?.nearestSite?.name || 'Unknown Site',
     verification_status: verificationStatus,
     confidence: combinedConfidence,
-    face_confidence: faceConfidence,
-    geo_confidence: geoConfidence,
-    voice_confidence: voiceConfidence,
-    geo_location: {
-      latitude: geoResult?.distance !== null ? 'recorded' : null,
-      longitude: geoResult?.distance !== null ? 'recorded' : null,
-      distance_meters: distance,
-    },
+    face_confidence: Math.round(faceConfidence),
+    geo_confidence: Math.round(geoConfidence),
+    voice_confidence: Math.round(voiceConfidence),
+    geo_location: distance !== null
+      ? { latitude: 'recorded', longitude: 'recorded', distance_meters: Math.round(distance) }
+      : null,
     voice_details: voiceResult?.workDetails || null,
     flagged_reason: flaggedReasons.join(' | ') || null,
     is_off_hours: isOffHours,
     created_at: timestamp,
   };
 
-  await putItem(config.tables.attendance, attendanceLog);
+  // Conditional write: only if there is no log for today yet (or only a rejected one), so two
+  // concurrent check-ins cannot both be logged and both increment total_days_logged
+  const written = await putItemIfAbsent(
+    config.tables.attendance,
+    attendanceLog,
+    { worker_id: workerId, log_date: logDate },
+    { replaceIf: { attr: 'verification_status', value: 'rejected' } },
+  );
+  if (!written) {
+    return duplicate('logged_concurrently');
+  }
 
   // If auto-approved, increment the worker's total days
   let totalDaysLogged = worker.total_days_logged || 0;
@@ -409,15 +462,14 @@ async function processMergeDecision(event) {
     totalDaysLogged = updated?.total_days_logged || totalDaysLogged + 1;
   }
 
-  const threshold = config.certificateThreshold;
   const daysRemaining = Math.max(0, threshold - totalDaysLogged);
 
   return {
     status: verificationStatus,
     confidence: combinedConfidence,
-    faceConfidence,
-    geoConfidence,
-    voiceConfidence,
+    faceConfidence: Math.round(faceConfidence),
+    geoConfidence: Math.round(geoConfidence),
+    voiceConfidence: Math.round(voiceConfidence),
     flaggedReasons,
     logDate,
     totalDaysLogged,
