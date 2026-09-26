@@ -3,6 +3,7 @@ import { useParams, useNavigate, useLocation } from 'react-router-dom';
 import PublicShell from '../components/PublicShell';
 import CredentialVerify from './CredentialVerify';
 import { tokenFromLocation } from '../utils/credential';
+import QRScanner from '../components/QRScanner';
 
 const API_BASE_URL = import.meta.env.VITE_API_URL || '';
 
@@ -136,11 +137,40 @@ function HashVerify() {
                 <p>Validate a worker's Smart Certificate using the SHA-256 hash from the QR code</p>
             </div>
 
-            {/* Manual Search: always available so another hash can be checked */}
+            {/* Manual Search or QR Scan */}
             <div className="card" style={{ maxWidth: '640px', marginBottom: '20px' }}>
-                <h3 style={{ marginBottom: '12px' }}>{status === 'idle' ? 'Enter Verification Hash' : 'Check Another Certificate'}</h3>
-                <p style={{ fontSize: '13px', color: 'var(--text-secondary)', marginBottom: '16px' }}>
-                    Paste the certificate hash from the QR code or certificate PDF:
+                <h3 style={{ marginBottom: '12px' }}>{status === 'idle' ? 'Scan QR Code or Enter Hash' : 'Check Another Certificate'}</h3>
+                
+                <div style={{ marginBottom: '20px' }}>
+                    <QRScanner onScanSuccess={(text) => {
+                        try {
+                            const url = new URL(text);
+                            // Extract token from hash or query
+                            const tokenMatch = url.hash.match(/^#?([^&]+)/) || url.search.match(/token=([^&]+)/);
+                            if (tokenMatch && tokenMatch[1] && tokenMatch[1].length > 64) {
+                                window.location.href = text; // Redirect to the scanned verify URL
+                            } else {
+                                // Extract hash from path or search if present
+                                const pathMatch = url.pathname.match(/\/verify\/([a-f0-9]+)/i);
+                                if (pathMatch && pathMatch[1]) {
+                                    navigate(`/verify/${pathMatch[1]}`);
+                                } else {
+                                    setManualHash(text);
+                                }
+                            }
+                        } catch {
+                            // If it's not a URL, it might be just a hash
+                            if (text.length === 64) {
+                                navigate(`/verify/${text}`);
+                            } else {
+                                setManualHash(text);
+                            }
+                        }
+                    }} />
+                </div>
+
+                <p style={{ fontSize: '13px', color: 'var(--text-secondary)', marginBottom: '16px', textAlign: 'center' }}>
+                    Or paste the certificate hash manually:
                 </p>
                 <form onSubmit={handleManualVerify} style={{ display: 'flex', gap: '8px' }}>
                     <input
