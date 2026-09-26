@@ -28,11 +28,17 @@ export function AuthProvider({ children }) {
   }, []);
 
   async function login(email, password) {
-    const res = await fetch(`${API_BASE_URL}/api/auth/login`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email, password }),
-    });
+    let res;
+    try {
+      res = await fetch(`${API_BASE_URL}/api/auth/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email, password }),
+      });
+    } catch {
+      // fetch rejects (e.g. "Failed to fetch") only when the server is unreachable
+      throw new Error('Could not reach the server. Check your connection.');
+    }
 
     if (!res.ok) {
       const data = await res.json().catch(() => ({}));

@@ -1,62 +1,74 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import {
     BarChart, Bar, PieChart, Pie, Cell, XAxis, YAxis, Tooltip,
     ResponsiveContainer, Legend, AreaChart, Area, CartesianGrid,
 } from 'recharts';
 import api from '../utils/api';
-
-const FALLBACK_CONFIDENCE = [
-    { name: 'Auto-Approved (>=80%)', value: 85, color: '#138808' },
-    { name: 'Pending Review (60-80%)', value: 10, color: '#ff9933' },
-    { name: 'Rejected (<60%)', value: 5, color: '#dc2626' },
-];
-
-const FALLBACK_DAILY = [
-    { day: 'Mon', logs: 0 }, { day: 'Tue', logs: 0 }, { day: 'Wed', logs: 0 },
-    { day: 'Thu', logs: 0 }, { day: 'Fri', logs: 0 }, { day: 'Sat', logs: 0 }, { day: 'Sun', logs: 0 },
-];
+import { networkErrorMessage } from '../utils/events';
 
 export default function Dashboard() {
     const [stats, setStats] = useState(null);
-    const [isLive, setIsLive] = useState(false);
+    const [error, setError] = useState('');
+    const [loading, setLoading] = useState(true);
     const [lastUpdated, setLastUpdated] = useState(null);
-    const [confidenceData, setConfidenceData] = useState(FALLBACK_CONFIDENCE);
-    const [dailyLogs, setDailyLogs] = useState(FALLBACK_DAILY);
+    const [confidenceData, setConfidenceData] = useState([]);
+    const [dailyLogs, setDailyLogs] = useState([]);
     const [siteData, setSiteData] = useState([]);
 
-    useEffect(() => {
-        async function fetchAll() {
-            try {
-                const res = await api.get('/api/admin/dashboard');
-                if (!res.ok) throw new Error(`HTTP ${res.status}`);
-                const data = await res.json();
-                setStats({
-                    active_workers: data.activeWorkers,
-                    total_workers: data.totalWorkers,
-                    pending_reviews: data.pendingReviews,
-                    total_days_logged: data.totalDaysLogged,
-                    average_days: data.averageDaysPerWorker,
-                    onboarding_workers: data.onboardingWorkers,
-                });
-                setIsLive(true);
-
-                // Chart data included in the same response
-                if (data.trends?.length) setDailyLogs(data.trends);
-                if (data.distribution?.length) setConfidenceData(data.distribution);
-                if (data.sites?.length) setSiteData(data.sites);
-            } catch {
-                setStats({
-                    active_workers: 0, total_workers: 0, pending_reviews: 0,
-                    total_days_logged: 0, average_days: 0, onboarding_workers: 0,
-                });
-                setIsLive(false);
+    const fetchAll = useCallback(async () => {
+        setLoading(true);
+        setError('');
+        try {
+            const res = await api.get('/api/admin/dashboard');
+            if (!res.ok) {
+                const err = await res.json().catch(() => ({}));
+                throw new Error(err.error || `HTTP ${res.status}`);
             }
+            const data = await res.json();
+            setStats({
+                active_workers: data.activeWorkers ?? 0,
+                total_workers: data.totalWorkers ?? 0,
+                pending_reviews: data.pendingReviews ?? 0,
+                total_days_logged: data.totalDaysLogged ?? 0,
+                average_days: data.averageDaysPerWorker ?? 0,
+                onboarding_workers: data.onboardingWorkers ?? 0,
+                certificate_threshold: typeof data.certificateThreshold === 'number' ? data.certificateThreshold : null,
+            });
+            // Charts come from the same response; never substitute made-up data
+            setDailyLogs(Array.isArray(data.trends) ? data.trends : []);
+            setConfidenceData(Array.isArray(data.distribution) ? data.distribution : []);
+            setSiteData(Array.isArray(data.sites) ? data.sites : []);
             setLastUpdated(new Date());
+        } catch (err) {
+            setStats(null);
+            setError(networkErrorMessage(err));
         }
-        fetchAll();
+        setLoading(false);
     }, []);
 
-    if (!stats) return <div style={{ padding: '40px', color: 'var(--text-muted)' }}>Loading...</div>;
+    useEffect(() => { fetchAll(); }, [fetchAll]);
+
+    if (loading && !stats) return <div style={{ padding: '40px', color: 'var(--text-muted)' }}>Loading...</div>;
+
+    if (error || !stats) {
+        return (
+            <div>
+                <div className="page-header">
+                    <h2>Dashboard</h2>
+                    <p>Real-time overview of Nirman Mitra platform activity</p>
+                </div>
+                <div className="card" role="alert" style={{ maxWidth: '640px', borderLeft: '4px solid var(--danger)' }}>
+                    <h3 style={{ marginBottom: '8px' }}>Could not load dashboard data</h3>
+                    <p style={{ fontSize: '14px', color: 'var(--text-secondary)', marginBottom: '16px' }}>{error || 'Unknown error'}</p>
+                    <button className="btn btn-primary btn-sm" onClick={fetchAll} disabled={loading}>
+                        {loading ? 'Retrying...' : 'Retry'}
+                    </button>
+                </div>
+            </div>
+        );
+    }
+
+    const hasDistribution = confidenceData.some(d => (d.value || 0) > 0);
 
     const SITE_COLORS = ['#138808', '#ff9933', '#000080', '#1a8c38', '#e67e22'];
 
@@ -72,20 +84,17 @@ export default function Dashboard() {
                         </p>
                     )}
                 </div>
-                <span style={{
-                    display: 'inline-flex', alignItems: 'center', gap: '6px',
-                    padding: '4px 12px', borderRadius: '20px', fontSize: '12px', fontWeight: 600,
-                    background: isLive ? 'rgba(19,136,8,0.1)' : 'rgba(255,153,51,0.1)',
-                    color: isLive ? '#138808' : '#ff9933',
-                    border: `1px solid ${isLive ? 'rgba(19,136,8,0.3)' : 'rgba(255,153,51,0.3)'}`,
-                }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
                     <span style={{
-                        width: '8px', height: '8px', borderRadius: '50%',
-                        background: isLive ? '#138808' : '#ff9933',
-                        boxShadow: isLive ? '0 0 6px #138808' : '0 0 6px #ff9933',
-                    }} />
-                    {isLive ? 'Live' : 'Demo'}
-                </span>
+                        display: 'inline-flex', alignItems: 'center', gap: '6px',
+                        padding: '4px 12px', borderRadius: '20px', fontSize: '12px', fontWeight: 600,
+                        background: 'rgba(19,136,8,0.1)', color: '#138808', border: '1px solid rgba(19,136,8,0.3)',
+                    }}>
+                        <span style={{ width: '8px', height: '8px', borderRadius: '50%', background: '#138808', boxShadow: '0 0 6px #138808' }} />
+                        Live
+                    </span>
+                    <button className="btn btn-outline btn-sm" onClick={fetchAll} disabled={loading}>{loading ? 'Refreshing...' : 'Refresh'}</button>
+                </div>
             </div>
 
             <div className="stat-grid">
@@ -110,6 +119,11 @@ export default function Dashboard() {
             <div className="charts-grid">
                 <div className="chart-card">
                     <h3>AI Confidence Distribution</h3>
+                    {!hasDistribution ? (
+                        <div style={{ height: 280, display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--text-muted)', fontSize: '14px' }}>
+                            No attendance logs yet
+                        </div>
+                    ) : (
                     <ResponsiveContainer width="100%" height={280}>
                         <PieChart>
                             <Pie data={confidenceData} cx="50%" cy="50%" innerRadius={60} outerRadius={100} dataKey="value"
@@ -120,6 +134,7 @@ export default function Dashboard() {
                             <Legend />
                         </PieChart>
                     </ResponsiveContainer>
+                    )}
                 </div>
 
                 <div className="chart-card">
@@ -178,8 +193,8 @@ export default function Dashboard() {
                                 <p style={{ fontSize: '28px', fontWeight: 700 }}>{stats.total_workers}</p>
                             </div>
                             <div>
-                                <p style={{ fontSize: '13px', color: 'var(--text-secondary)' }}>AWS Services Active</p>
-                                <p style={{ fontSize: '28px', fontWeight: 700, color: 'var(--accent-primary)' }}>15</p>
+                                <p style={{ fontSize: '13px', color: 'var(--text-secondary)' }}>{stats.certificate_threshold !== null ? 'Certificate Threshold' : 'Pending Reviews'}</p>
+                                <p style={{ fontSize: '28px', fontWeight: 700, color: 'var(--accent-primary)' }}>{stats.certificate_threshold !== null ? `${stats.certificate_threshold} days` : stats.pending_reviews}</p>
                             </div>
                         </div>
                     </div>
@@ -199,8 +214,8 @@ export default function Dashboard() {
                             <p style={{ fontSize: '24px', fontWeight: 700 }}>{stats.total_workers}</p>
                         </div>
                         <div>
-                            <p style={{ fontSize: '13px', color: 'var(--text-secondary)' }}>AWS Services Active</p>
-                            <p style={{ fontSize: '24px', fontWeight: 700, color: 'var(--accent-primary)' }}>15</p>
+                            <p style={{ fontSize: '13px', color: 'var(--text-secondary)' }}>{stats.certificate_threshold !== null ? 'Certificate Threshold' : 'Pending Reviews'}</p>
+                            <p style={{ fontSize: '24px', fontWeight: 700, color: 'var(--accent-primary)' }}>{stats.certificate_threshold !== null ? `${stats.certificate_threshold} days` : stats.pending_reviews}</p>
                         </div>
                     </div>
                 </div>
