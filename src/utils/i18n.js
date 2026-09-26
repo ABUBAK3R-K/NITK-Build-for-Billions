@@ -73,6 +73,10 @@ export const KN = {
 
   // ── Daily check-in (selfie → location → voice) ──
   checkinLocationButton: 'ಸೆಲ್ಫಿ ಸಿಕ್ಕಿತು! ಹಾಜರಿ ಪೂರ್ತಿ ಮಾಡಲು ಈಗ ನಿಮ್ಮ ಲೊಕೇಶನ್ ಕಳಿಸಿ. ಕೆಳಗಿನ ಬಟನ್ ಒತ್ತಿ.',
+  // Review outcome (needs a native-speaker check)
+  reviewApproved: (day, logged, remaining) => `${day} ರ ನಿಮ್ಮ ಹಾಜರಿಯನ್ನು ಕಲ್ಯಾಣ ಅಧಿಕಾರಿ ಅನುಮೋದಿಸಿದ್ದಾರೆ. ${logged} ದಿನ ದಾಖಲಾಗಿದೆ, ${remaining} ದಿನ ಬಾಕಿ.`,
+  reviewRejected: (day, reason) => `${day} ರ ನಿಮ್ಮ ಹಾಜರಿ ಅನುಮೋದನೆ ಆಗಲಿಲ್ಲ.${reason ? ` ಕಾರಣ: ${reason}.` : ''} ದಯವಿಟ್ಟು ಸೆಲ್ಫಿ, ಸ್ಥಳ ಮತ್ತು ವಾಯ್ಸ್ ನೋಟ್ ಜೊತೆ ಮತ್ತೆ ಹಾಜರಿ ಹಾಕಿ.`,
+  reviewCertificateHint: 'ನೀವು ಪ್ರಮಾಣಪತ್ರಕ್ಕೆ ಅರ್ಹರಾಗಿದ್ದೀರಿ. ಪಡೆಯಲು "certificate" ಕಳಿಸಿ.',
   checkinExpired: 'ಸೆಲ್ಫಿ 10 ನಿಮಿಷಕ್ಕಿಂತ ಹಳೆಯದಾಗಿರುವುದರಿಂದ ನಿಮ್ಮ ಹಾಜರಿ ಅವಧಿ ಮುಗಿದಿದೆ. ದಯವಿಟ್ಟು ಹೊಸ ಸೆಲ್ಫಿ ಕಳಿಸಿ ಮತ್ತೆ ಶುರು ಮಾಡಿ.',
   locationNoSelfie: 'ಲೊಕೇಶನ್ ಸಿಕ್ಕಿತು! ಈಗ ಹಾಜರಿ ಶುರು ಮಾಡಲು ಸೆಲ್ಫಿ ಕಳಿಸಿ.',
   selfieErrorRetry: 'ಏನೋ ತೊಂದರೆ ಆಯಿತು. ದಯವಿಟ್ಟು ಮತ್ತೆ ಸೆಲ್ಫಿ ಕಳಿಸಿ.',

@@ -30,6 +30,8 @@ import {
   normalizeEmail,
 } from '../middleware/auth.js';
 import { writeAudit, listAudit, credentialSubject, workerSubject } from '../services/audit.js';
+import { sendTextMessage } from '../utils/whatsapp.js';
+import { t, KN } from '../utils/i18n.js';
 import {
   handleCompanyRoute,
   handleAdminCompanyRoute,
@@ -604,6 +606,46 @@ function resolveLogKey(event, path, body) {
   return { workerId: logId, logDate: bodyLogDate };
 }
 
+/**
+ * Tell the worker on WhatsApp how their flagged day was decided. Best effort: the decision is
+ * already saved, so a send failure is logged and never fails the review.
+ */
+async function notifyReviewOutcome(workerId, logDate, action, reason, daysLogged) {
+  try {
+    const worker = await getItem(config.tables.workers, { worker_id: workerId });
+    if (!worker?.phone_number) return;
+    const language = worker.preferred_language || 'hi';
+    const [, mm, dd] = String(logDate).split('-');
+    const day = `${dd}/${mm}`;
+    let text;
+    if (action === 'approve') {
+      const logged = daysLogged ?? worker.total_days_logged ?? 0;
+      const remaining = Math.max(0, config.certificateThreshold - logged);
+      text = t(language, {
+        en: `Your attendance for ${day} was approved by the welfare officer. ${logged} days logged, ${remaining} remaining.`,
+        hi: `${day} ki aapki attendance welfare officer ne approve kar di. ${logged} din log hue, ${remaining} din baaki.`,
+        kn: KN.reviewApproved(day, logged, remaining),
+      });
+      if (remaining === 0) {
+        text += t(language, {
+          en: '\nYou are eligible for your certificate. Send "certificate" to get it.',
+          hi: '\nAap certificate ke liye eligible hain. Paane ke liye "certificate" bhejiye.',
+          kn: `\n${KN.reviewCertificateHint}`,
+        });
+      }
+    } else {
+      text = t(language, {
+        en: `Your attendance for ${day} could not be approved.${reason ? ` Reason: ${reason}.` : ''} Please check in again with a selfie, location and voice note.`,
+        hi: `${day} ki aapki attendance approve nahi ho saki.${reason ? ` Kaaran: ${reason}.` : ''} Kripya selfie, location aur voice note ke saath dobara check-in karein.`,
+        kn: KN.reviewRejected(day, reason),
+      });
+    }
+    await sendTextMessage(worker.phone_number, text);
+  } catch (err) {
+    console.warn('[AdminApi] Review outcome message not sent:', err.response?.status || err.message);
+  }
+}
+
 async function handleReviewAction(event, path, admin) {
   const body = parseBody(event);
   const action = optionalString(body.action);
@@ -659,13 +701,17 @@ async function handleReviewAction(event, path, admin) {
   }
 
   // Increment days logged when admin approves (matches auto_approved behavior)
+  let daysLogged = null;
   if (action === 'approve') {
     try {
-      await incrementDaysLogged(workerId);
+      const updated = await incrementDaysLogged(workerId);
+      daysLogged = updated?.total_days_logged ?? null;
     } catch (err) {
       console.error('[AdminApi] Failed to increment days logged:', err.message);
     }
   }
+
+  await notifyReviewOutcome(workerId, logDate, action, sanitizedJustification, daysLogged);
 
   await writeAudit({
     actor: `admin:${admin.admin_id}`,

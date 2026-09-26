@@ -19,6 +19,9 @@ const ddbDocClient = DynamoDBDocumentClient.from(
 );
 
 const TIMEOUT_MS = 10000;
+// gpt-oss reasoning tokens count against max_tokens (~200 even at low effort, more for Indic
+// scripts), so they get their own allowance on top of the caller's answer budget
+const REASONING_ALLOWANCE_TOKENS = 600;
 
 // ─────────────────────────────────────────────────────────
 // Cache helpers (LLM response cache table)
@@ -75,15 +78,15 @@ async function groqComplete({ system, prompt, json, maxTokens, model }) {
   if (system) messages.push({ role: 'system', content: system });
   messages.push({ role: 'user', content: prompt });
 
+  const reasons = model.startsWith('openai/gpt-oss');
   const body = {
     model,
     messages,
-    max_tokens: maxTokens,
+    max_tokens: maxTokens + (reasons ? REASONING_ALLOWANCE_TOKENS : 0),
     temperature: 0,
     ...(json && { response_format: { type: 'json_object' } }),
-    // gpt-oss models reason before answering; keep reasoning short so small
-    // max_tokens budgets still leave room for the (JSON) answer.
-    ...(model.startsWith('openai/gpt-oss') && { reasoning_effort: 'low' }),
+    // gpt-oss models reason before answering; keep reasoning short
+    ...(reasons && { reasoning_effort: 'low' }),
   };
 
   const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
@@ -97,7 +100,10 @@ async function groqComplete({ system, prompt, json, maxTokens, model }) {
   });
 
   if (!res.ok) {
-    throw new Error(`Groq request failed: HTTP ${res.status}`);
+    // Groq's error code and reason (never the prompt) so failures are diagnosable from the logs
+    const error = await res.json().then((b) => b.error, () => null);
+    const detail = error ? ` ${error.code || error.type}: ${error.failed_generation || error.message}` : '';
+    throw new Error(`Groq request failed: HTTP ${res.status}${detail}`.slice(0, 300));
   }
   const data = await res.json();
   return data.choices?.[0]?.message?.content || '';

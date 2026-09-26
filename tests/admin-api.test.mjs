@@ -41,3 +41,29 @@ test('a pending log can be reviewed once; repeats and non-pending logs are refus
   const missing = await callApi('PUT', '/api/admin/review/W1', { token, body: { ...body, logDate: '1999-01-01' } });
   assert.equal(missing.status, 404);
 });
+
+test('the worker hears about the decision on WhatsApp; a failed send does not fail the review', async () => {
+  const { putItem } = await import('../src/utils/dynamodb.js');
+  const phone = '919100008888';
+  const sentTo = () => H.wa.sent.filter((m) => m.to === phone).map((m) => m.text?.body);
+  await putItem('NirmanMitra-Workers-dev', { worker_id: 'W2', phone_number: phone, preferred_language: 'en', total_days_logged: 2 });
+  for (const d of ['2026-09-03', '2026-09-04', '2026-09-05']) {
+    await putItem('NirmanMitra-AttendanceLogs-dev', { worker_id: 'W2', log_date: d, verification_status: 'pending_review', timestamp: d });
+  }
+
+  await callApi('PUT', '/api/admin/review/W2', { token, body: { action: 'approve', workerId: 'W2', logDate: '2026-09-03' } });
+  assert.match(sentTo().at(-1), /03\/09 was approved.*3 days logged, 0 remaining\.\nYou are eligible for your certificate/s);
+
+  await callApi('PUT', '/api/admin/review/W2', {
+    token, body: { action: 'reject', workerId: 'W2', logDate: '2026-09-04', justification: 'Selfie shows a screen' },
+  });
+  assert.match(sentTo().at(-1), /04\/09 could not be approved\. Reason: Selfie shows a screen\./);
+
+  H.wa.failSend = true;
+  try {
+    const r = await callApi('PUT', '/api/admin/review/W2', { token, body: { action: 'approve', workerId: 'W2', logDate: '2026-09-05' } });
+    assert.equal(r.status, 200);
+  } finally {
+    H.wa.failSend = false;
+  }
+});
