@@ -182,9 +182,9 @@ export async function sendLocationRequest(phoneNumber, text) {
 export async function downloadMedia(mediaId) {
   if (isDemoMode() || noWhatsAppToken()) {
     console.log(`[WhatsApp STUB] Download media: ${mediaId}`);
-    // Return a tiny placeholder buffer in demo mode
+    // Return a unique placeholder buffer in demo mode based on mediaId
     return {
-      buffer: Buffer.from('demo-media-placeholder'),
+      buffer: Buffer.from(`demo-media-placeholder-${mediaId}`),
       contentType: 'application/octet-stream',
     };
   }
@@ -266,6 +266,7 @@ function parseMessage(message, contact) {
       timestamp: message.timestamp,
       type: message.type, // text, image, audio, location, document
       contactName: contact?.profile?.name || 'Unknown',
+      isForwarded: message.context?.forwarded || false,
     };
 
     // Extract type-specific content
@@ -286,6 +287,8 @@ function parseMessage(message, contact) {
       case 'location':
         parsed.latitude = message.location?.latitude;
         parsed.longitude = message.location?.longitude;
+        parsed.locationName = message.location?.name;
+        parsed.locationAddress = message.location?.address;
         break;
       case 'document':
         parsed.mediaId = message.document?.id;
