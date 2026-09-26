@@ -52,7 +52,7 @@ Object.assign(process.env, {
 });
 
 // ---------- fetch (Groq) ----------
-export const llm = { calls: [], responder: () => JSON.stringify({ intent: 'help', confidence: 80 }) };
+export const llm = { calls: [], responder: () => JSON.stringify({ intent: 'help', confidence: 80, passcode_match: true }) };
 export const transcribe = { text: 'aaj maine teesri manzil pe plaster kiya', fail: false, jobs: [] };
 const realFetch = globalThis.fetch;
 globalThis.fetch = async (url, opts) => {

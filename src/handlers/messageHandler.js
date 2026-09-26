@@ -10,6 +10,7 @@
  * 3. Active worker → Attendance check-in (Triple Verification) / progress queries
  */
 
+import crypto from 'crypto';
 import { LexRuntimeV2Client, RecognizeTextCommand } from '@aws-sdk/client-lex-runtime-v2';
 import { LambdaClient, InvokeCommand } from '@aws-sdk/client-lambda';
 import config, { apiResponse, isDemoMode, istDate } from '../utils/config.js';
@@ -213,6 +214,42 @@ async function handleIncomingMessage(message) {
 
   // Look up worker by phone number
   const existingWorker = await getWorkerByPhone(phoneNumber);
+  const language = existingWorker?.preferred_language || 'hi';
+
+  // --- ANTI-FRAUD CHECKS (Phase 1) ---
+  if (message.isForwarded) {
+    console.warn(`[Anti-Fraud] Blocked forwarded message from ${phoneNumber}`);
+    const text = t(language, {
+      en: 'Please record a new photo/voice note directly in this chat. Forwarded messages are not accepted.',
+      hi: 'Kripya is chat mein seedhe naya photo ya voice note record karein. Forward kiye gaye message manya nahi hain.',
+      kn: KN.antiFraudForwarded || 'ದಯವಿಟ್ಟು ಹೊಸ ಫೋಟೋ/ವಾಯ್ಸ್ ನೋಟ್ ಕಳುಹಿಸಿ. ಫಾರ್ವರ್ಡ್ ಮಾಡಿದ ಸಂದೇಶಗಳನ್ನು ಸ್ವೀಕರಿಸಲಾಗುವುದಿಲ್ಲ.',
+    });
+    await sendTextMessage(phoneNumber, text);
+    return apiResponse(200, { status: 'rejected_forwarded' });
+  }
+
+  if (message.type === 'location' && (message.locationName || message.locationAddress)) {
+    console.warn(`[Anti-Fraud] Blocked dropped pin from ${phoneNumber}`);
+    const text = t(language, {
+      en: 'Please share your live "Current Location", not a dropped pin.',
+      hi: 'Kripya apna live "Current Location" share karein, dropped pin nahi.',
+      kn: KN.antiFraudDroppedPin || 'ದಯವಿಟ್ಟು ನಿಮ್ಮ ಲೈವ್ "ಕರೆಂಟ್ ಲೊಕೇಶನ್" ಶೇರ್ ಮಾಡಿ.',
+    });
+    await sendTextMessage(phoneNumber, text);
+    return apiResponse(200, { status: 'rejected_dropped_pin' });
+  }
+
+  if (message.type === 'audio' && !message.isVoiceNote) {
+    console.warn(`[Anti-Fraud] Blocked audio file upload from ${phoneNumber}`);
+    const text = t(language, {
+      en: 'Please hold the microphone button to record a voice note. Audio file uploads are not accepted.',
+      hi: 'Kripya voice note record karne ke liye mic button dabakar rakhein. Audio file accept nahi hoti.',
+      kn: KN.antiFraudAudioFile || 'ದಯವಿಟ್ಟು ಮೈಕ್ರೊಫೋನ್ ಬಟನ್ ಹಿಡಿದು ವಾಯ್ಸ್ ನೋಟ್ ರೆಕಾರ್ಡ್ ಮಾಡಿ.',
+    });
+    await sendTextMessage(phoneNumber, text);
+    return apiResponse(200, { status: 'rejected_audio_file' });
+  }
+  // -----------------------------------
 
   if (!existingWorker) {
     // New worker — start registration
@@ -651,17 +688,20 @@ async function handleActiveWorker(workerId, worker, message) {
   if (message.type === 'location') {
     // Accept location if we have a pending selfie (in awaiting_location OR awaiting_voice state)
     if (state?.pending_selfie_key && (attendanceStep === 'awaiting_location' || attendanceStep === 'awaiting_voice')) {
+      const passcode = Math.floor(Math.random() * 90) + 10; // 10 to 99
+      
       // Store location, move to voice step
       await saveConversationState(workerId, workerId, {
         ...state,
         current_step: 'awaiting_voice',
         pending_latitude: message.latitude,
         pending_longitude: message.longitude,
+        passcode: passcode,
       });
       const voiceText = t(language, {
-        en: 'Location received! Now hold the mic button and tell us:\n• What work did you do today?\n• Which floor or area?\n\nExample: "Today I did painting work on 3rd floor"\n\nOr send "ok" to skip.',
-        hi: 'Location mil gaya! Ab mic button dabake bataiye:\n• Aaj kya kaam kiya?\n• Kaun si jagah pe?\n\nJaise: "Aaj maine 3rd floor pe painting ka kaam kiya"\n\nYa "ok" bhejiye skip karne ke liye.',
-        kn: KN.voiceAskAfterLocation,
+        en: `Location received! Now hold the mic button and tell us:\n• What work did you do today?\n• Which floor or area?\n• Please say the number "${passcode}"\n\nExample: "Today I did painting on 3rd floor, ${passcode}"\n\nOr send "ok" to skip.`,
+        hi: `Location mil gaya! Ab mic button dabake bataiye:\n• Aaj kya kaam kiya?\n• Kaun si jagah pe?\n• Kripya number "${passcode}" boliye\n\nJaise: "Aaj maine 3rd floor pe painting ka kaam kiya, ${passcode}"\n\nYa "ok" bhejiye skip karne ke liye.`,
+        kn: `ಸ್ಥಳ ಸ್ವೀಕರಿಸಲಾಗಿದೆ! ಈಗ ಮೈಕ್ ಬಟನ್ ಒತ್ತಿ ಹಿಡಿದು ಹೇಳಿ:\n• ಇಂದು ನೀವು ಯಾವ ಕೆಲಸ ಮಾಡಿದ್ದೀರಿ?\n• ಯಾವ ಮಹಡಿ ಅಥವಾ ಪ್ರದೇಶ?\n• ದಯವಿಟ್ಟು "${passcode}" ಸಂಖ್ಯೆಯನ್ನು ಹೇಳಿ\n\nಉದಾಹರಣೆಗೆ: "ಇಂದು ನಾನು 3ನೇ ಮಹಡಿಯಲ್ಲಿ ಪೇಂಟಿಂಗ್ ಮಾಡಿದ್ದೇನೆ, ${passcode}"\n\nಅಥವಾ ಸ್ಕಿಪ್ ಮಾಡಲು "ok" ಕಳುಹಿಸಿ.`,
       });
       await sendTextMessage(phoneNumber, voiceText);
       return apiResponse(200, { status: 'location_stored_awaiting_voice', workerId });
@@ -1245,14 +1285,31 @@ async function handleSelfiePendingLocation(workerId, worker, message, language) 
   const phoneNumber = message.from;
 
   try {
-    // Download and upload selfie to S3
+    // Download media
     const media = await downloadMedia(message.mediaId);
+
+    // ANTI-FRAUD: Duplicate Image Detection (Phase 2)
+    const imageHash = crypto.createHash('sha256').update(media.buffer).digest('hex');
+    const recentAttendance = await queryItems(config.tables.attendance, 'worker_id = :wid', { ':wid': workerId });
+    if (recentAttendance.some(record => record.image_hash === imageHash)) {
+      console.warn(`[Anti-Fraud] Duplicate selfie upload from ${phoneNumber}`);
+      const text = t(language, {
+        en: 'You have already used this photo for a previous check-in. Please take a fresh selfie today.',
+        hi: 'Aapne yeh photo pehle ke attendance ke liye use kiya hai. Kripya aaj ka naya selfie lein.',
+        kn: KN.antiFraudDuplicateSelfie || 'ನೀವು ಈ ಫೋಟೋವನ್ನು ಹಿಂದಿನ ಹಾಜರಾತಿಗೆ ಬಳಸಿದ್ದೀರಿ. ದಯವಿಟ್ಟು ಇಂದಿನ ಹೊಸ ಸೆಲ್ಫಿ ತೆಗೆದುಕೊಳ್ಳಿ.',
+      });
+      await sendTextMessage(phoneNumber, text);
+      return apiResponse(200, { status: 'rejected_duplicate_selfie' });
+    }
+
+    // Upload selfie to S3
     const uploadResult = await uploadWorkerMedia(workerId, 'checkin-selfie', media.buffer, 'image/jpeg');
 
     // Save selfie key in conversation state — wait for location
     await saveConversationState(workerId, workerId, {
       current_step: 'awaiting_location',
       pending_selfie_key: uploadResult.key,
+      pending_selfie_hash: imageHash,
       pending_voice: message.caption || '',
       preferred_language: language,
     });
@@ -1272,8 +1329,10 @@ async function handleSelfiePendingLocation(workerId, worker, message, language) 
       await saveConversationState(workerId, workerId, {
         current_step: 'awaiting_voice',
         pending_selfie_key: uploadResult.key,
+        pending_selfie_hash: imageHash,
         pending_latitude: null,
         pending_longitude: null,
+        passcode: null,
         preferred_language: language,
       });
       const voiceText = t(language, {
@@ -1324,7 +1383,7 @@ async function processFullAttendance(workerId, worker, language, state, voiceTra
     const [faceResult, geoResult, voiceResult] = await Promise.all([
       attendanceHandler({ task: 'face_verify', workerId, selfieKey, bucket: config.buckets.mediaRaw }),
       attendanceHandler({ task: 'geo_verify', workerId, latitude, longitude }),
-      attendanceHandler({ task: 'voice_verify', workerId, voiceTranscription: voice, language }),
+      attendanceHandler({ task: 'voice_verify', workerId, voiceTranscription: voice, language, passcode: state.passcode || null }),
     ]);
 
     const decision = await attendanceHandler({
@@ -1333,6 +1392,7 @@ async function processFullAttendance(workerId, worker, language, state, voiceTra
       faceResult,
       geoResult,
       voiceResult,
+      imageHash: state.pending_selfie_hash || null,
       language,
     });
 
