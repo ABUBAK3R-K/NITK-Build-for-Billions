@@ -247,3 +247,20 @@ test('a check-in expires if the location or voice comes more than 10 minutes aft
   await send(phone, M.audio('v1'));
   assert.equal(logsFor(w.worker_id)[0].verification_status, 'auto_approved');
 });
+
+test('every voice request asks for the one-time number and does not advertise skipping', async () => {
+  const phone = '919200000024';
+  const w = await onboard(phone);
+  await send(phone, M.image('c1'));
+  const viaLocation = await send(phone, M.location());
+  assert.match(viaLocation.replies[0], /number "\d{2}"/);
+  assert.doesNotMatch(viaLocation.replies[0], /skip/i);
+
+  // Skipping the location still asks for a number, and the check-in goes to review
+  await putItem(config.tables.conversation, { ...H.states(w.worker_id).at(-1), current_step: 'awaiting_location', passcode: null });
+  const viaSkip = await send(phone, M.text('skip'));
+  const { passcode } = H.states(w.worker_id).at(-1);
+  assert.ok(passcode >= 10 && passcode <= 99);
+  assert.match(viaSkip.replies[0], new RegExp(`number "${passcode}"`));
+  assert.doesNotMatch(viaSkip.replies[0], /skip/i);
+});
