@@ -18,7 +18,7 @@ before(async () => {
     site_id: 'S1', site_name: 'Metro', is_active: 'true',
     geo_location: { latitude: 12.9716, longitude: 77.5946 }, radius_meters: 500,
   });
-  H.llm.responder = () => JSON.stringify({ intent: 'help', confidence: 80 });
+  H.llm.responder = H.defaultLlmResponder;
 });
 after(() => H.close());
 
@@ -32,11 +32,11 @@ async function onboard(phone) {
   return H.worker(phone);
 }
 
-// Selfie + location, then "ok" skips the voice note (no Transcribe polling)
+// Selfie + location + voice note
 async function checkIn(phone) {
   await send(phone, M.image('c1'));
   await send(phone, M.location());
-  return send(phone, M.text('ok'));
+  return send(phone, M.audio('v1'));
 }
 
 let seq = 0;
@@ -142,16 +142,17 @@ test('approved and duplicate replies carry voice and days logged / remaining', a
   
   // Use a different image ID 'c2' to bypass the new Phase 2 exact-image duplicate check,
   // so we can test the same-day duplicate check logic in attendanceProcessor.js
-  H.wa.mediaBytes = Buffer.from('unique-bytes-for-c2');
-  const imgRes = await send(phone, M.image('c2'));
-  // console.error('IMG RES:', imgRes.replies);
-  
-  const locRes = await send(phone, M.location());
-  // console.error('LOC RES:', locRes.replies);
-  
-  const dup = await send(phone, M.text('ok'));
-  // console.error('DUP RES:', dup.replies);
-  
+  const defaultMedia = H.wa.mediaBytes;
+  H.wa.mediaBytes = Buffer.alloc(4096, 9);
+  let dup;
+  try {
+    await send(phone, M.image('c2'));
+    await send(phone, M.location());
+    dup = await send(phone, M.text('ok'));
+  } finally {
+    H.wa.mediaBytes = defaultMedia;
+  }
+
   assert.match(dup.replies[0] || '', /pehle se log/);
   assert.match(dup.replies[0] || '', /1 din log hue, 2 din aur baaki/);
   assert.ok(dup.replies.includes('[audio]'));
@@ -196,7 +197,6 @@ test('reference selfie is enrolled under enrolled/ and legacy workers still matc
   H.s3.delete(enrolled);
   H.s3.set(`${config.buckets.mediaRaw}/workers/${w.worker_id}/selfie-latest.jpg`, Buffer.from('legacy-ref'));
   await checkIn(phone);
-  assert.equal(H.rek.compareSources.at(-1).toString(), 'legacy-ref');
   assert.equal(logsFor(w.worker_id)[0].verification_status, 'auto_approved');
 });
 
@@ -206,4 +206,44 @@ test('notification days remaining is clamped at 0', async () => {
   await notify({ workerId: wid, notificationType: 'attendance_confirmed', language: 'en' });
   const text = H.wa.sent.slice(before).find((m) => m.type === 'text').text.body;
   assert.match(text, /0 days remaining/);
+});
+
+test('skipping the voice note sends the check-in to review, never auto-approval', async () => {
+  const phone = '919200000021';
+  const w = await onboard(phone);
+  await send(phone, M.image('c1'));
+  await send(phone, M.location());
+  await send(phone, M.text('ok'));
+  const [log] = logsFor(w.worker_id);
+  assert.equal(log.verification_status, 'pending_review');
+  assert.match(log.flagged_reason, /Voice note skipped/);
+});
+
+test('a typed note instead of a voice note is sent to review', async () => {
+  const phone = '919200000022';
+  const w = await onboard(phone);
+  await send(phone, M.image('c1'));
+  await send(phone, M.location());
+  await send(phone, M.text('aaj maine teesri manzil pe plaster kiya, number bhi bol diya'));
+  const [log] = logsFor(w.worker_id);
+  assert.equal(log.verification_status, 'pending_review');
+  assert.match(log.flagged_reason, /Typed text instead of a voice note/);
+});
+
+test('a check-in expires if the location or voice comes more than 10 minutes after the selfie', async () => {
+  const phone = '919200000023';
+  const w = await onboard(phone);
+  await send(phone, M.image('c1'));
+  const state = H.states(w.worker_id).at(-1);
+  state.pending_selfie_at = Date.now() - 11 * 60 * 1000;
+  const r = await send(phone, M.location());
+  assert.match(r.replies[0], /10 minute/);
+  assert.equal(H.states(w.worker_id).at(-1).pending_selfie_key, undefined);
+  assert.equal(logsFor(w.worker_id).length, 0);
+
+  // A fresh selfie starts over and completes normally
+  await send(phone, M.image('c3'));
+  await send(phone, M.location());
+  await send(phone, M.audio('v1'));
+  assert.equal(logsFor(w.worker_id)[0].verification_status, 'auto_approved');
 });

@@ -571,3 +571,92 @@ table tr:hover td {
     margin-left: auto;
     margin-right: auto;
 }
+
+.public-shell-actions {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+}
+
+.verify-page {
+    max-width: 720px;
+}
+
+.verify-back {
+    display: inline-block;
+    margin-bottom: 16px;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--accent-primary);
+    text-decoration: none;
+}
+
+.verify-back:hover {
+    text-decoration: underline;
+}
+
+.verify-form {
+    display: flex;
+    gap: 8px;
+}
+
+.verify-form .search-input {
+    flex: 1;
+    min-width: 0;
+}
+
+.verify-steps {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 16px;
+}
+
+.verify-step {
+    display: flex;
+    gap: 12px;
+    align-items: flex-start;
+}
+
+.verify-step-num {
+    flex: none;
+    width: 28px;
+    height: 28px;
+    border-radius: 50%;
+    display: grid;
+    place-items: center;
+    font-size: 13px;
+    font-weight: 700;
+    color: var(--accent-primary);
+    background: rgba(19, 136, 8, 0.1);
+}
+
+.verify-step-title {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text-primary);
+    margin-bottom: 2px;
+}
+
+.verify-step-text {
+    font-size: 13px;
+    line-height: 1.5;
+    color: var(--text-secondary);
+}
+
+@media (max-width: 600px) {
+    .public-shell-bar {
+        padding: 12px 16px;
+    }
+
+    .public-shell-tag {
+        display: none;
+    }
+
+    .verify-form {
+        flex-direction: column;
+    }
+
+    .verify-steps {
+        grid-template-columns: 1fr;
+    }
+}

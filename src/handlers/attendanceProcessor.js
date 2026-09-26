@@ -426,12 +426,21 @@ async function processMergeDecision(event) {
     flaggedReasons.push('No GPS data available');
   }
 
-  // Voice rules
-  if (!voiceResult?.workDetails?.is_work_related) {
+  // Voice rules: only a spoken note that describes work (and says the number) can auto-approve
+  const voiceSource = event.voiceSource || 'audio';
+  if (voiceSource === 'none') {
+    flaggedReasons.push('Voice note skipped');
+  } else if (voiceSource === 'text') {
+    flaggedReasons.push('Typed text instead of a voice note');
+  }
+  if (voiceSource !== 'none' && !voiceResult?.workDetails?.is_work_related) {
     flaggedReasons.push('Voice note not work-related');
   } else if (voiceResult?.workDetails?.passcode_mismatch) {
     flaggedReasons.push('Passcode check failed');
   }
+  const voiceVerified = voiceSource === 'audio'
+    && voiceResult?.workDetails?.is_work_related === true
+    && !voiceResult?.workDetails?.passcode_mismatch;
 
   // Off-hours check
   const isOffHours = currentHour < 6 || currentHour >= 20;
@@ -445,7 +454,7 @@ async function processMergeDecision(event) {
 
   if (hasHardFail) {
     verificationStatus = 'rejected';
-  } else if (faceConfidence >= 60 && geoConfidence >= 60 && !flaggedReasons.some(r => r.includes('spoof'))) {
+  } else if (faceConfidence >= 60 && geoConfidence >= 60 && voiceVerified && !flaggedReasons.some(r => r.includes('spoof'))) {
     verificationStatus = 'auto_approved';
   } else {
     verificationStatus = 'pending_review';

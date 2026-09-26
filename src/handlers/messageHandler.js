@@ -165,6 +165,8 @@ const USER_CONTENT_TYPES = new Set(['text', 'image', 'audio', 'video', 'document
 
 // Processed WhatsApp message ids are remembered this long, covering Meta's redelivery window
 const DEDUP_TTL_SECONDS = 2 * 24 * 60 * 60;
+// Selfie, location and voice note must all arrive within this window
+const CHECKIN_WINDOW_MS = 10 * 60 * 1000;
 
 /** Handle every message in a webhook payload (Meta may batch several into one POST) */
 async function handleIncomingMessages(body) {
@@ -708,7 +710,24 @@ async function handleActiveWorker(workerId, worker, message) {
   const language = worker.preferred_language || 'hi';
 
   // Check attendance flow state first
-  const state = await getConversationState(workerId);
+  let state = await getConversationState(workerId);
+
+  // A check-in must be finished within CHECKIN_WINDOW_MS of the selfie, so a selfie taken
+  // at home cannot be paired with a location shared at the site hours later
+  if (state?.pending_selfie_key && state.pending_selfie_at && Date.now() - state.pending_selfie_at > CHECKIN_WINDOW_MS) {
+    state = { current_step: 'active', preferred_language: language };
+    await saveConversationState(workerId, workerId, state);
+    const continuesCheckin = message.type === 'location' || message.type === 'audio'
+      || (message.type === 'text' && !(message.buttonId && BUTTON_INTENTS[message.buttonId]));
+    if (continuesCheckin) {
+      await sendTextMessage(phoneNumber, t(language, {
+        en: 'Your check-in expired because the selfie is more than 10 minutes old. Please send a fresh selfie to start again.',
+        hi: 'Aapka check-in samay khatam ho gaya, selfie 10 minute se purani hai. Kripya nayi selfie bhejkar dobara shuru karein.',
+        kn: KN.checkinExpired,
+      }));
+      return apiResponse(200, { status: 'checkin_expired', workerId });
+    }
+  }
   const attendanceStep = state?.current_step;
 
   // Text messages — check if we're in attendance flow first
@@ -721,10 +740,10 @@ async function handleActiveWorker(workerId, worker, message) {
     if (attendanceStep === 'awaiting_voice' && state?.pending_selfie_key) {
       const lower = (message.text || '').toLowerCase().trim();
       if (lower.length < 20 || /\b(ok|done|skip|haan|ha|theek|bas)\b/.test(lower)) {
-        return await processFullAttendance(workerId, worker, language, state, null);
+        return await processFullAttendance(workerId, worker, language, state, null, 'none');
       }
-      // Longer text — use as voice transcription directly
-      return await processFullAttendance(workerId, worker, language, state, message.text);
+      // Longer text is kept as the work description, but only a spoken note can auto-approve
+      return await processFullAttendance(workerId, worker, language, state, message.text, 'text');
     }
     // If awaiting location, "skip" skips GPS
     if (attendanceStep === 'awaiting_location' && state?.pending_selfie_key) {
@@ -1383,6 +1402,7 @@ async function handleSelfiePendingLocation(workerId, worker, message, language) 
       current_step: 'awaiting_location',
       pending_selfie_key: uploadResult.key,
       pending_selfie_hash: imageHash,
+      pending_selfie_at: Date.now(),
       pending_voice: message.caption || '',
       preferred_language: language,
     });
@@ -1433,7 +1453,8 @@ async function handleSelfiePendingLocation(workerId, worker, message, language) 
 // Called after all inputs collected (voice may be null/skipped)
 // ─────────────────────────────────────────────────────────
 
-async function processFullAttendance(workerId, worker, language, state, voiceTranscription) {
+/** voiceSource: 'audio' (a voice note), 'text' (typed instead) or 'none' (skipped); only audio can auto-approve */
+async function processFullAttendance(workerId, worker, language, state, voiceTranscription, voiceSource = 'audio') {
   const phoneNumber = worker.phone_number;
 
   try {
@@ -1466,6 +1487,7 @@ async function processFullAttendance(workerId, worker, language, state, voiceTra
       geoResult,
       voiceResult,
       imageHash: state.pending_selfie_hash || null,
+      voiceSource: voiceTranscription ? voiceSource : 'none',
       language,
     });
 

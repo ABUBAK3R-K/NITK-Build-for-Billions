@@ -20,7 +20,7 @@ async function activeWorker(workerId, phone, language = 'en') {
 
 before(async () => {
   H.quiet();
-  H.llm.responder = () => JSON.stringify({ intent: 'help', confidence: 80 });
+  H.llm.responder = H.defaultLlmResponder;
   await activeWorker('w-ss-1', '918200000001');
   await activeWorker('w-ss-2', '918200000002');
   await activeWorker('w-ss-3', '918200000003');

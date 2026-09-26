@@ -15,7 +15,7 @@ before(async () => {
     site_id: 'S1', site_name: 'Metro', is_active: 'true',
     geo_location: { latitude: 12.9716, longitude: 77.5946 }, radius_meters: 500,
   });
-  H.llm.responder = () => JSON.stringify({ intent: 'help', confidence: 80 });
+  H.llm.responder = H.defaultLlmResponder;
 });
 after(() => H.close());
 
@@ -32,7 +32,7 @@ async function onboard(phone) {
 async function checkIn(phone) {
   await send(phone, M.image('c1'));
   await send(phone, M.location());
-  return send(phone, M.text('ok'));
+  return send(phone, M.audio('v1'));
 }
 
 test('a redelivered message id is processed only once', async () => {

@@ -74,11 +74,25 @@ Three independent checks run **in parallel**:
 
 | Result | Condition |
 | --- | --- |
-| **Auto-approved** | Face ≥ 60 and geo ≥ 60 |
-| **Rejected** | Face < 30, or distance beyond 2× the site radius |
-| **Pending review** | Anything else; queued for an admin |
+| **Auto-approved** | Face ≥ 60, geo ≥ 60, **and** a spoken voice note that describes work and says the one-time number |
+| **Rejected** | Face < 30, distance beyond 2× the site radius, or the wrong one-time number |
+| **Pending review** | Anything else, including a skipped or typed voice note; queued for an admin |
 
-**Also flagged:** off-hours submissions (before 06:00 or after 20:00 IST) and non-work voice notes.
+**Also flagged (a note for the reviewer, not a block):** off-hours submissions (before 06:00 or after 20:00 IST), non-work voice notes, and blurry or glaring selfies (possible photo of a screen).
+
+**Site attribution:** a worker is not tied to one company. Each check-in is attributed to the nearest active site whose geo-fence contains the shared location, and appears on the dashboard of the company that owns that site.
+
+**Anti-misuse checks in this build:**
+
+| Misuse | Check |
+| --- | --- |
+| Re-sending an old selfie | SHA-256 of the image compared with the worker's recent check-ins |
+| Forwarded photo or voice note | WhatsApp forwarded flag; rejected |
+| Picking a place on the map | Locations with a place name or address are refused; only "current location" is accepted |
+| Replaying an old voice note | A random two-digit number per check-in must be spoken |
+| Skipping or typing the voice note | Allowed, but only a spoken note can auto-approve; others go to review |
+| Selfie now, location hours later | Selfie, location and voice note must arrive within 10 minutes |
+| Two check-ins in a day | One log per worker per IST date (conditional write) |
 
 **Duplicates:** one check-in per worker per day.
 
@@ -195,7 +209,21 @@ Officer / Admin (browser) ──► React dashboard + officer portal (AWS Amplif
 
 ---
 
-## 8. Out of scope (roadmap)
+## 8. Known gaps (anti-misuse roadmap)
+
+Honest limits of verifying attendance over WhatsApp, and the planned answer to each.
+
+| Gap | Why it is open | Planned mitigation |
+| --- | --- | --- |
+| Mock-location apps | WhatsApp passes on whatever GPS the phone reports; a spoofing app looks like a real "current location" | Flag identical coordinates day after day (real GPS jitters), impossible travel between check-ins, and a mismatch with the SIM's telecom circle |
+| Gallery or edited selfies | WhatsApp does not say if a photo was just taken and strips its metadata; the image hash only catches exact copies | Perceptual (near-duplicate) matching against the worker's past selfies; a random gesture in the selfie ("show two fingers") as lightweight liveness |
+| Photo of a photo or screen | Only a blur and glare heuristic today | Liveness detection (Rekognition Face Liveness or a gesture prompt) |
+| Check in, then leave | One check-in covers the day | A random mid-shift location ping, or a check-out step |
+| One person, two numbers | Registration does not search the face or Aadhaar against other workers | Search each new face against all enrolled workers; flag a repeated Aadhaar last-4 plus name |
+| One phone checking in many workers | Each worker uses their own number, but a contractor could hold several SIMs | Flag several workers checking in from identical coordinates within a minute |
+| Officer collusion | Approvals are audited, but one officer can approve an auto-rejected day | Two-person approval for overturning an automatic rejection |
+
+## 9. Out of scope (roadmap)
 
 - Bhashini speech services and languages beyond Kannada, Hindi and English
 - e-Shram UAN linkage and DigiLocker issuance
@@ -207,7 +235,7 @@ Officer / Admin (browser) ──► React dashboard + officer portal (AWS Amplif
 
 ---
 
-## 9. Success criteria
+## 10. Success criteria
 
 - A credential issued on WhatsApp verifies in the portal **with no server call**.
 - An officer goes from scan to "Verified" in **under 5 seconds**.
@@ -216,7 +244,7 @@ Officer / Admin (browser) ──► React dashboard + officer portal (AWS Amplif
 
 ---
 
-## 10. Communication rules
+## 11. Communication rules
 
 - **Claims:** state only what works at the time of saying it.
   - Languages: "Kannada, Hindi and English today".
@@ -225,7 +253,7 @@ Officer / Admin (browser) ──► React dashboard + officer portal (AWS Amplif
 
 ---
 
-## 11. References
+## 12. References
 
 *Every number used in the pitch must carry its source. Fill in each source or remove the claim before submission.*
 
