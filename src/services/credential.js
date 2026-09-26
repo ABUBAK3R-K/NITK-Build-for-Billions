@@ -19,7 +19,9 @@ function getSigningKey() {
     signingKeyPromise = (async () => {
       const raw = config.credential.signingJwk;
       if (!raw) throw new Error('CREDENTIAL_SIGNING_JWK is not configured');
-      const jwk = JSON.parse(raw);
+      // Accept the JWK as raw JSON or base64 (base64 survives deployment parameter parsing)
+      const json = raw.trim().startsWith('{') ? raw : Buffer.from(raw, 'base64').toString('utf8');
+      const jwk = JSON.parse(json);
       return { key: await importJWK(jwk, 'ES256'), kid: jwk.kid || 'key-1' };
     })().catch((err) => {
       signingKeyPromise = null;
