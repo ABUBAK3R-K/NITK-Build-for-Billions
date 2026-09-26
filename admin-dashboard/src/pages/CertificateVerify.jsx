@@ -1,6 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { useParams, useNavigate, useLocation } from 'react-router-dom';
-import PublicShell from '../components/PublicShell';
+import { Link, useParams, useNavigate, useLocation } from 'react-router-dom';
 import CredentialVerify from './CredentialVerify';
 import { tokenFromLocation } from '../utils/credential';
 
@@ -21,9 +20,10 @@ export default function CertificateVerify() {
     const token = tokenFromLocation(location);
 
     return (
-        <PublicShell>
+        <div className="verify-page">
             {token ? (
                 <>
+                    <Link to="/verify" className="verify-back">&larr; Check another certificate</Link>
                     <div className="page-header">
                         <h2>Verify Work Credential</h2>
                         <p>Signed proof of verified work days, checked against the issuer&apos;s public key</p>
@@ -33,7 +33,7 @@ export default function CertificateVerify() {
             ) : (
                 <HashVerify />
             )}
-        </PublicShell>
+        </div>
     );
 }
 
@@ -120,8 +120,16 @@ function HashVerify() {
 
     function handleManualVerify(e) {
         e.preventDefault();
-        const h = manualHash.trim();
-        if (!h) return;
+        const input = manualHash.trim();
+        if (!input) return;
+        // A signed credential, alone or inside a /verify#<token> link, is verified in the browser
+        const token = input.match(/eyJ[\w-]*\.[\w-]+\.[\w-]+/)?.[0];
+        if (token) {
+            navigate(`/verify#${token}`);
+            return;
+        }
+        // A /verify/<hash> link or a bare hash
+        const h = input.match(/\/verify\/([^/?#\s]+)/)?.[1] || input;
         if (h === hash) fetchCertificate(h); // same URL: re-check without a route change
         else navigate(`/verify/${encodeURIComponent(h)}`);
     }
@@ -132,42 +140,51 @@ function HashVerify() {
     return (
         <div>
             <div className="page-header">
-                <h2>Verify Certificate</h2>
-                <p>Validate a worker's Smart Certificate using the SHA-256 hash from the QR code</p>
+                <h2>Verify a Worker Certificate</h2>
+                <p>Scan the QR code on the certificate with your phone camera, or paste its link or code below.</p>
             </div>
 
-            {/* Manual Search: always available so another hash can be checked */}
-            <div className="card" style={{ maxWidth: '640px', marginBottom: '20px' }}>
-                <h3 style={{ marginBottom: '12px' }}>{status === 'idle' ? 'Enter Verification Hash' : 'Check Another Certificate'}</h3>
+            {/* Manual entry: always available so another certificate can be checked */}
+            <div className="card" style={{ marginBottom: '20px' }}>
+                <h3 style={{ marginBottom: '6px' }}>{status === 'idle' ? 'Check a certificate' : 'Check another certificate'}</h3>
                 <p style={{ fontSize: '13px', color: 'var(--text-secondary)', marginBottom: '16px' }}>
-                    Paste the certificate hash from the QR code or certificate PDF:
+                    Accepts the verification link from the QR code, the signed credential, or the certificate hash printed on the PDF.
                 </p>
-                <form onSubmit={handleManualVerify} style={{ display: 'flex', gap: '8px' }}>
+                <form onSubmit={handleManualVerify} className="verify-form">
                     <input
                         className="search-input"
                         type="text"
-                        placeholder="Paste verification hash..."
-                        aria-label="Verification hash"
+                        placeholder="Paste link, credential or hash"
+                        aria-label="Verification link, credential or hash"
+                        autoComplete="off"
+                        spellCheck={false}
                         value={manualHash}
                         onChange={e => setManualHash(e.target.value)}
-                        style={{ flex: 1, minWidth: 0 }}
                     />
-                    <button className="btn btn-primary btn-sm" type="submit" disabled={!manualHash.trim() || loading}>
+                    <button className="btn btn-primary" type="submit" disabled={!manualHash.trim() || loading}>
                         Verify
                     </button>
                 </form>
             </div>
 
+            {status === 'idle' && (
+                <div className="verify-steps">
+                    <VerifyStep n="1" title="Scan the QR" text="Point any phone camera at the QR code on the certificate." />
+                    <VerifyStep n="2" title="Checked on your device" text="The signature is checked in your browser against the issuer's public key." />
+                    <VerifyStep n="3" title="See the result" text="Verified days, sites and dates, or a clear warning if anything was changed." />
+                </div>
+            )}
+
             {/* Loading */}
             {loading && (
-                <div className="card" style={{ maxWidth: '640px', textAlign: 'center', padding: '40px' }}>
+                <div className="card" style={{ textAlign: 'center', padding: '40px' }}>
                     <p style={{ color: 'var(--text-muted)' }}>Verifying certificate...</p>
                 </div>
             )}
 
             {/* Network / API error: distinct from "not found" */}
             {status === 'error' && (
-                <div className="card" role="alert" style={{ maxWidth: '640px', textAlign: 'center', padding: '32px 24px' }}>
+                <div className="card" role="alert" style={{ textAlign: 'center', padding: '32px 24px' }}>
                     <span className="badge pending" style={{ fontSize: '15px', padding: '8px 24px', borderRadius: '24px' }}>
                         Verification Unavailable
                     </span>
@@ -182,7 +199,7 @@ function HashVerify() {
 
             {/* Result Card */}
             {(status === 'verified' || status === 'notfound') && (
-                <div className="card" style={{ maxWidth: '640px' }}>
+                <div className="card">
                     {/* Status Badge */}
                     <div style={{ textAlign: 'center', marginBottom: '24px' }}>
                         {verified ? (
@@ -308,6 +325,18 @@ function HashVerify() {
                     )}
                 </div>
             )}
+        </div>
+    );
+}
+
+function VerifyStep({ n, title, text }) {
+    return (
+        <div className="verify-step">
+            <span className="verify-step-num" aria-hidden="true">{n}</span>
+            <div>
+                <p className="verify-step-title">{title}</p>
+                <p className="verify-step-text">{text}</p>
+            </div>
         </div>
     );
 }

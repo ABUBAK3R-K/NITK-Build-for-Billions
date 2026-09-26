@@ -134,6 +134,26 @@ test('name: spoken / typed lead-ins are stripped', async () => {
   await H.agree('919300000010');
   await send('919300000010', M.text('My name is Anil'));
   assert.equal(H.worker('919300000010').name, 'Anil');
+
+  await send('919300000091', M.text('Hi'));
+  await H.agree('919300000091');
+  await send('919300000091', M.text("My name is Rajesh, and I've been working on the site all day laying bricks and mixing cement."));
+  assert.equal(H.worker('919300000091').name, 'Rajesh');
+
+  await send('919300000092', M.text('Namaste'));
+  await H.agree('919300000092');
+  await send('919300000092', M.text('mera naam Ramesh hai aur main mistri hoon'));
+  assert.equal(H.worker('919300000092').name, 'Ramesh');
+});
+
+test('name: a long answer that is not a name is asked again', async () => {
+  const phone = '919300000093';
+  await send(phone, M.text('Hello'));
+  await H.agree(phone);
+  await send(phone, M.text('Kal subah saat baje site par aaunga kaam karne ke liye pakka'));
+  assert.equal(H.worker(phone).name, undefined);
+  await send(phone, M.text('Anand'));
+  assert.equal(H.worker(phone).name, 'Anand');
 });
 
 test('name: a voice note is transcribed under the worker id and cleaned', async () => {

@@ -3,6 +3,7 @@ import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
 import { AuthProvider } from './context/AuthContext';
 import ProtectedRoute from './components/ProtectedRoute';
 import Layout from './components/Layout';
+import VerifyFrame from './components/VerifyFrame';
 import ReviewQueue from './pages/ReviewQueue';
 import WorkerSearch from './pages/WorkerSearch';
 import CertificateVerify from './pages/CertificateVerify';
@@ -32,8 +33,10 @@ export default function App() {
                         <Route path="/" element={<Navigate to="/home" replace />} />
                         <Route path="home" element={<LandingPage />} />
                         <Route path="login" element={<LoginPage />} />
-                        <Route path="verify" element={<CertificateVerify />} />
-                        <Route path="verify/:hash" element={<CertificateVerify />} />
+                        <Route path="verify" element={<VerifyFrame />}>
+                            <Route index element={<CertificateVerify />} />
+                            <Route path=":hash" element={<CertificateVerify />} />
+                        </Route>
                         <Route element={<ProtectedRoute roles={ADMIN_ROLES}><Layout /></ProtectedRoute>}>
                             <Route path="dashboard" element={<Suspense fallback={<PageFallback />}><Dashboard /></Suspense>} />
                             <Route path="review" element={<ReviewQueue />} />

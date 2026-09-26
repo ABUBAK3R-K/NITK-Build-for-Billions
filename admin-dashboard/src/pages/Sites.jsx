@@ -150,8 +150,7 @@ export default function Sites() {
                 <p>Construction sites and their geofences used for GPS attendance verification</p>
             </div>
 
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(300px, 1fr))', gap: '20px', alignItems: 'start' }}>
-                <div className="card">
+            <div className="card" style={{ marginBottom: '20px' }}>
                     <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
                         <h3>All Sites ({sites.length})</h3>
                         <button className="btn btn-outline btn-sm" onClick={fetchSites} disabled={loading}>{loading ? 'Loading...' : 'Refresh'}</button>
@@ -168,7 +167,7 @@ export default function Sites() {
                     )}
                     <div className="table-container">
                         <table>
-                            <thead><tr><th>Name</th><th>Latitude</th><th>Longitude</th><th>Radius</th><th>Status</th><th>Company</th></tr></thead>
+                            <thead><tr><th>Name</th><th>Company</th><th>Location</th><th>Radius</th><th>Status</th></tr></thead>
                             <tbody>
                                 {sites.map((s, i) => {
                                     const active = pick(s, 'is_active', 'active');
@@ -178,14 +177,6 @@ export default function Sites() {
                                                 <strong>{pick(s, 'name', 'site_name') || '-'}</strong>
                                                 {s.site_id && <div style={{ fontSize: '12px', color: 'var(--text-muted)' }}>{s.site_id}</div>}
                                             </td>
-                                            <td>{fmtCoord(pick(s, 'latitude', 'lat', 'location.latitude', 'location.lat'))}</td>
-                                            <td>{fmtCoord(pick(s, 'longitude', 'lng', 'lon', 'location.longitude', 'location.lng'))}</td>
-                                            <td>{pick(s, 'radius_meters', 'radius') ?? '-'} m</td>
-                                            <td>
-                                                <span className={`badge ${active === false ? 'rejected' : 'active'}`}>
-                                                    {active === false ? 'inactive' : 'active'}
-                                                </span>
-                                            </td>
                                             <td>
                                                 <select className="search-input" aria-label={`Company for ${pick(s, 'name', 'site_name')}`}
                                                     value={s.company_id || ''} onChange={(e) => assignCompany(s, e.target.value)}>
@@ -193,17 +184,28 @@ export default function Sites() {
                                                     {companies.map((c) => <option key={c.company_id} value={c.company_id}>{c.name}</option>)}
                                                 </select>
                                             </td>
+                                            <td style={{ whiteSpace: 'nowrap' }}>
+                                                {fmtCoord(pick(s, 'latitude', 'lat', 'location.latitude', 'location.lat'))},{' '}
+                                                {fmtCoord(pick(s, 'longitude', 'lng', 'lon', 'location.longitude', 'location.lng'))}
+                                            </td>
+                                            <td>{pick(s, 'radius_meters', 'radius') ?? '-'} m</td>
+                                            <td>
+                                                <span className={`badge ${active === false ? 'rejected' : 'active'}`}>
+                                                    {active === false ? 'inactive' : 'active'}
+                                                </span>
+                                            </td>
                                         </tr>
                                     );
                                 })}
                                 {!loading && sites.length === 0 && !loadError && (
-                                    <tr><td colSpan="6" style={{ textAlign: 'center', padding: '40px', color: 'var(--text-muted)' }}>No sites yet. Add one using the form.</td></tr>
+                                    <tr><td colSpan="5" style={{ textAlign: 'center', padding: '40px', color: 'var(--text-muted)' }}>No sites yet. Add one using the form below.</td></tr>
                                 )}
                             </tbody>
                         </table>
                     </div>
-                </div>
+            </div>
 
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(320px, 1fr))', gap: '20px', alignItems: 'start' }}>
                 <div className="card">
                     <h3 style={{ marginBottom: '16px' }}>Add Site</h3>
                     <form onSubmit={handleSubmit} noValidate>
@@ -252,9 +254,9 @@ export default function Sites() {
                         </button>
                     </form>
                 </div>
-            </div>
 
-            <CompaniesPanel companies={companies} onChanged={fetchCompanies} />
+                <CompaniesPanel companies={companies} onChanged={fetchCompanies} />
+            </div>
         </div>
     );
 }

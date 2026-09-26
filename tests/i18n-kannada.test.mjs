@@ -19,7 +19,7 @@ before(async () => {
     site_id: 'S-KN', site_name: 'Metro', is_active: 'true',
     geo_location: { latitude: 12.9716, longitude: 77.5946 }, radius_meters: 500,
   });
-  H.llm.responder = () => JSON.stringify({ intent: 'help', confidence: 80 });
+  H.llm.responder = H.defaultLlmResponder;
 });
 after(() => H.close());
 

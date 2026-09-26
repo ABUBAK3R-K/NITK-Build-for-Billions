@@ -41,7 +41,7 @@ export default function CompaniesPanel({ companies, onChanged }) {
     }
 
     return (
-        <div className="card" style={{ marginTop: '20px' }}>
+        <div className="card">
             <h3 style={{ marginBottom: '4px' }}>Companies ({companies.length})</h3>
             <p style={{ fontSize: '13px', color: 'var(--text-secondary)', marginBottom: '16px' }}>
                 Construction companies get a view-only dashboard of the sites assigned to them.

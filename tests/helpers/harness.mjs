@@ -52,7 +52,11 @@ Object.assign(process.env, {
 });
 
 // ---------- fetch (Groq) ----------
-export const llm = { calls: [], responder: () => JSON.stringify({ intent: 'help', confidence: 80, passcode_match: true }) };
+// Voice check-in prompts get a passing work note; everything else a help intent
+export const defaultLlmResponder = (prompt) => (prompt.includes('voice note')
+  ? JSON.stringify({ is_work_related: true, activity: 'plaster', location_mention: '3rd floor', confidence: 90, passcode_match: true })
+  : JSON.stringify({ intent: 'help', confidence: 80, passcode_match: true }));
+export const llm = { calls: [], responder: defaultLlmResponder };
 export const transcribe = { text: 'aaj maine teesri manzil pe plaster kiya', fail: false, jobs: [] };
 const realFetch = globalThis.fetch;
 globalThis.fetch = async (url, opts) => {

@@ -18,7 +18,7 @@ before(async () => {
     site_id: 'S1', site_name: 'Metro', is_active: 'true',
     geo_location: { latitude: 12.9716, longitude: 77.5946 }, radius_meters: 500,
   });
-  H.llm.responder = () => JSON.stringify({ intent: 'help', confidence: 80 });
+  H.llm.responder = H.defaultLlmResponder;
 });
 after(() => H.close());
 
@@ -70,7 +70,7 @@ test('the certificate PDF is delivered as a WhatsApp document and re-sent on req
   const before = H.wa.sent.length;
   await send(phone, M.image('c1'));
   await send(phone, M.location());
-  await send(phone, M.text('ok'));
+  await send(phone, M.audio('v1'));
   const [doc] = docsSent(before);
   assert.ok(doc, 'certificate sent as a document');
   assert.match(doc.document.filename, /\.pdf$/);

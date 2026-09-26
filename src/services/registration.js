@@ -170,7 +170,7 @@ export async function handleNameCapture(workerId, audioBuffer, textMessage, lang
   // Clean up the name
   // Allow Unicode letters (Hindi, Tamil, etc.) + spaces + dots
   name = stripNameLeadIns(name.replace(/[^\p{L}\p{M}\s.]/gu, '').trim());
-  if (!name || name.length < 2) {
+  if (!isPlausibleName(name)) {
     const responseText = getStepPrompt('awaiting_name', language);
     const audioUrl = await generateAndUploadVoice(workerId, responseText, language, 'name-retry');
     return { name: null, responseText, audioUrl, nextStep: 'awaiting_name' };
@@ -199,10 +199,23 @@ export async function handleNameCapture(workerId, audioBuffer, textMessage, lang
 // "mera naam Ram Kumar hai" / "my name is Ram" / "main Ram hoon" → the name alone
 const NAME_LEAD_IN = /^(?:(?:mera|meraa|my|मेरा)\s+(?:naam|name|नाम)(?:\s+(?:is|hai|है))?|(?:naam|name|नाम)(?:\s+(?:is|hai|है))?|i\s+am|im|main|mai|मैं)\s+/iu;
 const NAME_TRAILER = /\s+(?:hai|hoon|hun|hu|है|हूँ|हूं|हू)$/iu;
+// A voice answer often runs on: "Rajesh and I have been working..." keeps only "Rajesh"
+const NAME_RUN_ON = /\s+(?:and|aur|or|but|from|i|main|mai|मैं|और|ಮತ್ತು|ನಾನು)\s.*$/iu;
+const MAX_NAME_WORDS = 4;
+const MAX_NAME_LENGTH = 40;
 
-/** Strip common spoken lead-ins and trailing "hai"/"hoon" from a captured name */
+/** Strip common spoken lead-ins, trailing "hai"/"hoon" and any run-on sentence from a captured name */
 export function stripNameLeadIns(text) {
-  return String(text || '').trim().replace(NAME_LEAD_IN, '').replace(NAME_TRAILER, '').trim();
+  return String(text || '').trim()
+    .replace(NAME_LEAD_IN, '')
+    .replace(NAME_RUN_ON, '')
+    .replace(NAME_TRAILER, '')
+    .trim();
+}
+
+/** A sentence left over after cleaning is not a name; ask again rather than store it */
+function isPlausibleName(name) {
+  return name.length >= 2 && name.length <= MAX_NAME_LENGTH && name.split(/\s+/).length <= MAX_NAME_WORDS;
 }
 
 // ─────────────────────────────────────────────────────────
