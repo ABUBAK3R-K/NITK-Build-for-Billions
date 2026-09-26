@@ -1,8 +1,9 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import api from '../utils/api';
 import { networkErrorMessage } from '../utils/events';
+import CompaniesPanel from '../components/CompaniesPanel';
 
-const EMPTY_FORM = { name: '', latitude: '', longitude: '', radius_meters: '200', is_active: true };
+const EMPTY_FORM = { name: '', latitude: '', longitude: '', radius_meters: '200', is_active: true, company_id: '' };
 
 function pick(site, ...keys) {
     for (const k of keys) {
@@ -42,6 +43,45 @@ export default function Sites() {
     const [submitError, setSubmitError] = useState('');
     const [success, setSuccess] = useState('');
     const [submitting, setSubmitting] = useState(false);
+    const [companies, setCompanies] = useState([]);
+    const [assignError, setAssignError] = useState('');
+
+    const fetchCompanies = useCallback(async () => {
+        try {
+            const res = await api.get('/api/admin/companies');
+            if (!res.ok) return;
+            const data = await res.json();
+            setCompanies(data.companies || []);
+        } catch {
+            // The site list still works without the company list
+        }
+    }, []);
+
+    useEffect(() => { fetchCompanies(); }, [fetchCompanies]);
+
+    /** Assign or clear a site's company (re-sends the site's current details with the new company) */
+    async function assignCompany(site, companyId) {
+        setAssignError('');
+        try {
+            const res = await api.post('/api/admin/sites', {
+                site_id: site.site_id,
+                name: pick(site, 'name', 'site_name'),
+                latitude: Number(pick(site, 'latitude')),
+                longitude: Number(pick(site, 'longitude')),
+                radius_meters: Number(pick(site, 'radius_meters')),
+                is_active: pick(site, 'is_active') !== false,
+                company_id: companyId || null,
+            });
+            if (!res.ok) {
+                const body = await res.json().catch(() => ({}));
+                throw new Error(body.error || `HTTP ${res.status}`);
+            }
+            fetchSites();
+            fetchCompanies();
+        } catch (err) {
+            setAssignError(networkErrorMessage(err));
+        }
+    }
 
     const fetchSites = useCallback(async () => {
         setLoading(true);
@@ -85,6 +125,7 @@ export default function Sites() {
                 longitude: Number(form.longitude),
                 radius_meters: Number(form.radius_meters),
                 is_active: !!form.is_active,
+                ...(form.company_id && { company_id: form.company_id }),
             });
             const data = await res.json().catch(() => ({}));
             if (!res.ok) {
@@ -95,6 +136,7 @@ export default function Sites() {
             setSuccess(`Site "${form.name.trim()}" saved.`);
             setForm(EMPTY_FORM);
             fetchSites();
+            fetchCompanies();
         } catch (err) {
             setSubmitError(networkErrorMessage(err));
         }
@@ -114,6 +156,11 @@ export default function Sites() {
                         <h3>All Sites ({sites.length})</h3>
                         <button className="btn btn-outline btn-sm" onClick={fetchSites} disabled={loading}>{loading ? 'Loading...' : 'Refresh'}</button>
                     </div>
+                    {assignError && (
+                        <p role="alert" style={{ fontSize: '13px', color: 'var(--danger)', marginBottom: '12px' }}>
+                            Could not update the company: {assignError}
+                        </p>
+                    )}
                     {loadError && (
                         <p role="alert" style={{ fontSize: '13px', color: 'var(--danger)', marginBottom: '12px' }}>
                             Could not load sites: {loadError}
@@ -121,7 +168,7 @@ export default function Sites() {
                     )}
                     <div className="table-container">
                         <table>
-                            <thead><tr><th>Name</th><th>Latitude</th><th>Longitude</th><th>Radius</th><th>Status</th></tr></thead>
+                            <thead><tr><th>Name</th><th>Latitude</th><th>Longitude</th><th>Radius</th><th>Status</th><th>Company</th></tr></thead>
                             <tbody>
                                 {sites.map((s, i) => {
                                     const active = pick(s, 'is_active', 'active');
@@ -139,11 +186,18 @@ export default function Sites() {
                                                     {active === false ? 'inactive' : 'active'}
                                                 </span>
                                             </td>
+                                            <td>
+                                                <select className="search-input" aria-label={`Company for ${pick(s, 'name', 'site_name')}`}
+                                                    value={s.company_id || ''} onChange={(e) => assignCompany(s, e.target.value)}>
+                                                    <option value="">None</option>
+                                                    {companies.map((c) => <option key={c.company_id} value={c.company_id}>{c.name}</option>)}
+                                                </select>
+                                            </td>
                                         </tr>
                                     );
                                 })}
                                 {!loading && sites.length === 0 && !loadError && (
-                                    <tr><td colSpan="5" style={{ textAlign: 'center', padding: '40px', color: 'var(--text-muted)' }}>No sites yet. Add one using the form.</td></tr>
+                                    <tr><td colSpan="6" style={{ textAlign: 'center', padding: '40px', color: 'var(--text-muted)' }}>No sites yet. Add one using the form.</td></tr>
                                 )}
                             </tbody>
                         </table>
@@ -179,6 +233,14 @@ export default function Sites() {
                                 onChange={e => update('radius_meters', e.target.value)} />
                             {fieldErrors.radius_meters && <div style={fieldErrorStyle}>{fieldErrors.radius_meters}</div>}
                         </div>
+                        <div style={{ marginBottom: '12px' }}>
+                            <label style={labelStyle} htmlFor="site-company">Company (optional)</label>
+                            <select id="site-company" className="search-input" style={{ width: '100%' }} value={form.company_id}
+                                onChange={e => update('company_id', e.target.value)}>
+                                <option value="">None</option>
+                                {companies.map((c) => <option key={c.company_id} value={c.company_id}>{c.name}</option>)}
+                            </select>
+                        </div>
                         <label style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '14px', marginBottom: '16px' }}>
                             <input type="checkbox" checked={form.is_active} onChange={e => update('is_active', e.target.checked)} />
                             Active
@@ -191,6 +253,8 @@ export default function Sites() {
                     </form>
                 </div>
             </div>
+
+            <CompaniesPanel companies={companies} onChanged={fetchCompanies} />
         </div>
     );
 }

@@ -51,7 +51,13 @@ export function requireRole(decodedToken, allowedRoles) {
  */
 export async function generateTokenPair(admin) {
   const accessToken = jwt.sign(
-    { admin_id: admin.admin_id, email: admin.email, role: admin.role },
+    {
+      admin_id: admin.admin_id,
+      email: admin.email,
+      role: admin.role,
+      // Company accounts carry their company, which scopes every /api/company/* query
+      ...(admin.company_id && { company_id: admin.company_id }),
+    },
     config.jwt.secret,
     { expiresIn: config.jwt.accessTokenExpiry },
   );
