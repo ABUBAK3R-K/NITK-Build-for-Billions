@@ -1,5 +1,8 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { useParams, useNavigate } from 'react-router-dom';
+import { useParams, useNavigate, useLocation } from 'react-router-dom';
+import PublicShell from '../components/PublicShell';
+import CredentialVerify from './CredentialVerify';
+import { tokenFromLocation } from '../utils/credential';
 
 const API_BASE_URL = import.meta.env.VITE_API_URL || '';
 
@@ -9,7 +12,32 @@ function formatAadhaarLast4(last4) {
     return digits.length === 4 ? `XXXX XXXX ${digits}` : null;
 }
 
+/**
+ * /verify#<token>: signed credential, verified in the browser.
+ * /verify and /verify/<hash>: certificate lookup by SHA-256 hash.
+ */
 export default function CertificateVerify() {
+    const location = useLocation();
+    const token = tokenFromLocation(location);
+
+    return (
+        <PublicShell>
+            {token ? (
+                <>
+                    <div className="page-header">
+                        <h2>Verify Work Credential</h2>
+                        <p>Signed proof of verified work days, checked against the issuer&apos;s public key</p>
+                    </div>
+                    <CredentialVerify token={token} />
+                </>
+            ) : (
+                <HashVerify />
+            )}
+        </PublicShell>
+    );
+}
+
+function HashVerify() {
     const { hash } = useParams();
     const navigate = useNavigate();
     // status: idle | loading | verified | notfound | error
