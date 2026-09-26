@@ -5,11 +5,6 @@
  */
 
 import { PollyClient, SynthesizeSpeechCommand } from '@aws-sdk/client-polly';
-import {
-  TranscribeClient,
-  StartTranscriptionJobCommand,
-  GetTranscriptionJobCommand,
-} from '@aws-sdk/client-transcribe';
 import config, { isDemoMode } from '../utils/config.js';
 import { complete } from '../providers/llm.js';
 import { uploadProcessedAudio, uploadWorkerMedia, downloadFromS3 } from '../utils/s3.js';
@@ -18,7 +13,6 @@ import { withRetry } from '../utils/retryHelper.js';
 import { KN } from '../utils/i18n.js';
 
 const pollyClient = new PollyClient({ region: config.aws.region });
-const transcribeClient = new TranscribeClient({ region: config.aws.region });
 
 // ─────────────────────────────────────────────────────────
 // Language Detection
@@ -110,22 +104,12 @@ export function parseLanguageSwitch(text) {
 // Voice Transcription
 // ─────────────────────────────────────────────────────────
 
-// Language code mapping for Amazon Transcribe
-const TRANSCRIBE_LANGUAGE_MAP = {
-  hi: 'hi-IN',
-  en: 'en-IN',
-  ta: 'ta-IN',
-  te: 'te-IN',
-  kn: 'kn-IN',
-  ml: 'ml-IN',
-  bn: 'bn-IN',
-  mr: 'mr-IN',
-  gu: 'gu-IN',
-};
+// Language mapping is simplified as Whisper generally accepts ISO 639-1 ('hi', 'en', 'kn', etc)
+// Groq Whisper API endpoint will be used for fast processing.
 
 /**
- * Transcribe a voice note to text using Amazon Transcribe.
- * Uploads audio to S3, starts a Transcribe job, polls for result.
+ * Transcribe a voice note to text using Groq Whisper.
+ * Uploads audio to S3, then directly posts to Groq API.
  * @param {Buffer} audioBuffer - Audio file buffer (ogg/wav/mp3)
  * @param {string} language - ISO 639-1 code
  * @param {string} [workerId] - Worker ID for S3 path
@@ -143,64 +127,45 @@ export async function transcribeVoice(audioBuffer, language = 'hi', workerId = '
   }
 
   try {
-    // Step 1: Upload audio to S3 for Transcribe
-    const audioKey = `voice-transcriptions/${workerId}/${Date.now()}.ogg`;
-    const uploadResult = await uploadWorkerMedia(workerId, 'voice-note', audioBuffer, 'audio/ogg');
-    const s3Uri = `s3://${config.buckets.mediaRaw}/${uploadResult.key || audioKey}`;
+    // Step 1: Upload audio to S3 for auditing (don't block transcription on it though we await it)
+    await uploadWorkerMedia(workerId, 'voice-note', audioBuffer, 'audio/ogg').catch(e => console.error('[S3] Upload failed:', e));
 
-    // Step 2: Start Transcribe job
-    const jobName = `nirman-${workerId}-${Date.now()}`;
-    const outputKey = `transcriptions/${jobName}.json`;
-    const languageCode = TRANSCRIBE_LANGUAGE_MAP[language] || 'hi-IN';
+    // Step 2: Use native fetch + FormData for Node to hit Groq Whisper
+    const blob = new Blob([audioBuffer], { type: 'audio/ogg' });
+    const formData = new FormData();
+    formData.append('file', blob, 'audio.ogg');
+    formData.append('model', 'whisper-large-v3-turbo'); 
+    formData.append('language', language);
+    formData.append('response_format', 'json');
 
-    await withRetry(
-      () => transcribeClient.send(
-        new StartTranscriptionJobCommand({
-          TranscriptionJobName: jobName,
-          LanguageCode: languageCode,
-          MediaFormat: 'ogg',
-          Media: { MediaFileUri: s3Uri },
-          OutputBucketName: config.buckets.mediaProcessed,
-          OutputKey: outputKey,
-        }),
-      ),
-      { label: 'Transcribe:StartJob' },
-    );
+    const groqKey = config.llm.groqApiKey;
+    if (!groqKey) throw new Error('GROQ_API_KEY is not set');
 
-    // Step 3: Poll for completion (max ~20 seconds)
-    let transcript = '';
-    for (let i = 0; i < 20; i++) {
-      await new Promise((r) => setTimeout(r, 1000));
-
-      const status = await transcribeClient.send(
-        new GetTranscriptionJobCommand({ TranscriptionJobName: jobName }),
-      );
-
-      const jobStatus = status.TranscriptionJob?.TranscriptionJobStatus;
-
-      if (jobStatus === 'COMPLETED') {
-        // The output bucket is private, so read the result with the S3 SDK (a plain fetch of
-        // TranscriptFileUri returns 403)
-        const body = await downloadFromS3(config.buckets.mediaProcessed, outputKey);
-        const data = JSON.parse(body.toString('utf-8'));
-        transcript = data.results?.transcripts?.[0]?.transcript || '';
-        break;
+    const result = await withRetry(async () => {
+      const response = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${groqKey}`
+        },
+        body: formData
+      });
+      if (!response.ok) {
+        const errText = await response.text();
+        throw new Error(`Groq API error ${response.status}: ${errText}`);
       }
+      return response.json();
+    }, { label: 'Groq:Whisper' });
 
-      if (jobStatus === 'FAILED') {
-        console.error('[Transcribe] Job failed:', status.TranscriptionJob?.FailureReason);
-        break;
-      }
-    }
+    const transcript = result?.text || '';
 
     if (transcript) {
-      console.log(`[Transcribe] Result: "${transcript.substring(0, 100)}"`);
+      console.log(`[Whisper] Result: "${transcript.substring(0, 100)}"`);
     } else {
-      console.warn('[Transcribe] No transcript produced');
+      console.warn('[Whisper] No transcript produced');
     }
     return transcript;
   } catch (err) {
-    console.error('Transcribe failed:', err.message);
+    console.error('Whisper failed:', err.message);
     return '';
   }
 }
