@@ -1,20 +1,11 @@
 /**
  * Nirman Mitra — Conditional Writes
- * putItem() in utils/dynamodb.js always overwrites. Writes that must happen at most once
- * (one check-in per day, webhook de-duplication) use a conditional PutCommand instead, so two
- * concurrent requests cannot both succeed.
+ * putItem() in utils/dynamodb.js overwrites unless given a condition. Writes that must happen at
+ * most once (one check-in per day, webhook de-duplication) go through here, so two concurrent
+ * requests cannot both succeed — in DynamoDB and in the local in-memory store alike.
  */
 
-import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
-import { DynamoDBDocumentClient, PutCommand } from '@aws-sdk/lib-dynamodb';
-import config, { isDemoMode } from '../utils/config.js';
-import { getItem, putItem } from '../utils/dynamodb.js';
-
-const IS_DEMO = isDemoMode();
-const docClient = IS_DEMO ? null : DynamoDBDocumentClient.from(
-  new DynamoDBClient({ region: config.aws.region }),
-  { marshallOptions: { removeUndefinedValues: true } },
-);
+import { putItem } from '../utils/dynamodb.js';
 
 /**
  * Put an item only if no item with the same primary key exists.
@@ -26,27 +17,17 @@ const docClient = IS_DEMO ? null : DynamoDBDocumentClient.from(
  * @returns {Promise<boolean>} true if written, false if an item already existed
  */
 export async function putItemIfAbsent(tableName, item, key, { replaceIf } = {}) {
-  if (IS_DEMO) {
-    // In-memory store is single-process, so read-then-write is good enough locally
-    const existing = await getItem(tableName, key);
-    if (existing && !(replaceIf && existing[replaceIf.attr] === replaceIf.value)) return false;
-    await putItem(tableName, item);
-    return true;
-  }
-
-  const params = {
-    TableName: tableName,
-    Item: item,
-    ConditionExpression: `attribute_not_exists(${Object.keys(key)[0]})`,
-  };
+  let condition = `attribute_not_exists(${Object.keys(key)[0]})`;
+  let values;
+  let names;
   if (replaceIf) {
-    params.ConditionExpression += ' OR #replace_attr = :replace_value';
-    params.ExpressionAttributeNames = { '#replace_attr': replaceIf.attr };
-    params.ExpressionAttributeValues = { ':replace_value': replaceIf.value };
+    condition += ' OR #replace_attr = :replace_value';
+    names = { '#replace_attr': replaceIf.attr };
+    values = { ':replace_value': replaceIf.value };
   }
 
   try {
-    await docClient.send(new PutCommand(params));
+    await putItem(tableName, item, condition, values, names);
     return true;
   } catch (err) {
     if (err.name === 'ConditionalCheckFailedException') return false;
