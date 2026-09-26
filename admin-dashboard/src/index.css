@@ -531,3 +531,43 @@ table tr:hover td {
         grid-template-columns: 1fr;
     }
 }
+/* ── Public pages (credential verification) ── */
+.public-shell {
+    min-height: 100vh;
+    background: var(--bg-primary);
+}
+
+.public-shell-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 14px 24px;
+    background: var(--bg-secondary);
+    border-bottom: 1px solid var(--border-color);
+}
+
+.public-shell-brand {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-weight: 700;
+    color: var(--text-primary);
+    text-decoration: none;
+}
+
+.public-shell-tag {
+    font-size: 13px;
+    color: var(--text-muted);
+}
+
+.public-shell-main {
+    max-width: 720px;
+    margin: 0 auto;
+    padding: 32px 16px 48px;
+}
+
+.public-shell-main .card {
+    margin-left: auto;
+    margin-right: auto;
+}
