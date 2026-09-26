@@ -23,6 +23,11 @@ const config = Object.freeze({
   // Public URL of the dashboard / officer portal (no trailing slash); certificate QR codes link here
   portalUrl: (process.env.PORTAL_URL || '').replace(/\/+$/, ''),
 
+  // Signed work credentials: issuer's ES256 private key as a JWK (JSON string)
+  credential: {
+    signingJwk: process.env.CREDENTIAL_SIGNING_JWK || '',
+  },
+
   // Team phone numbers (digits only, comma-separated) allowed to use the "demo cert" /
   // "test review" keywords. Empty means nobody can.
   demoPhoneNumbers: (process.env.DEMO_PHONE_NUMBERS || '')

@@ -28,6 +28,12 @@ Parameters:
     Default: ''
     Description: Optional email address for Lambda error alarms (leave empty for no notifications)
 
+  CredentialSigningKey:
+    Type: String
+    Default: ''
+    NoEcho: true
+    Description: Issuer ES256 private key (JWK, base64-encoded) used to sign work credentials
+
   DemoPhoneNumbers:
     Type: String
     Default: ''
@@ -103,6 +109,7 @@ Globals:
         ENVIRONMENT: !Ref Environment
         CERTIFICATE_THRESHOLD: !Ref CertificateThreshold
         DEMO_PHONE_NUMBERS: !Ref DemoPhoneNumbers
+        CREDENTIAL_SIGNING_JWK: !Ref CredentialSigningKey
         PORTAL_URL: !Ref PortalUrl
         WORKERS_TABLE: !Ref WorkersTable
         ATTENDANCE_TABLE: !Ref AttendanceLogsTable

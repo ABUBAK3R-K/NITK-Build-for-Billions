@@ -19,6 +19,7 @@ import QRCode from 'qrcode';
 import config, { istDate } from '../utils/config.js';
 import { getItem, putItem, queryItems, updateItem } from '../utils/dynamodb.js';
 import { uploadToS3, generatePresignedUrl } from '../utils/s3.js';
+import { issueWorkCredential, canIssueCredentials } from '../services/credential.js';
 
 export const handler = async (event) => {
   console.log('CertificateGenerator event:', JSON.stringify(event).substring(0, 500));
@@ -180,12 +181,30 @@ async function issueCertificate(workerId, certificateId) {
   // Generate BOCW reference number (mock for prototype)
   const bocwReference = `BOCW-${new Date().getFullYear()}-${Math.random().toString(36).substring(2, 8).toUpperCase()}`;
 
-  // Verification link encoded in the QR code: the officer page on the portal
-  const verificationUrl = getVerificationUrl(verificationHash);
-  const qrPng = await QRCode.toBuffer(verificationUrl, { type: 'png', margin: 1, width: 300 });
+  // Signed credential: the QR carries the whole signed token, so an officer's browser can
+  // verify it offline. Without a signing key, fall back to the hash lookup link.
+  let credential = null;
+  if (canIssueCredentials()) {
+    credential = await issueWorkCredential({
+      certificateId,
+      workerId,
+      workerName,
+      aadhaarLast4: certData.aadhaarLast4,
+      verifiedDays: approvedLogs.length,
+      dateFrom,
+      dateTo,
+      sites: sitesWorked,
+    });
+  } else {
+    console.warn('[Certificate] Signing key or PORTAL_URL missing; issuing an unsigned certificate');
+  }
+  const verificationUrl = credential ? credential.verifyUrl : getVerificationUrl(verificationHash);
+  // Low error correction keeps the long token QR scannable from a phone screen
+  const qrPng = await QRCode.toBuffer(verificationUrl, { type: 'png', margin: 2, width: 600, errorCorrectionLevel: 'L' });
 
   // Build PDF content
-  const pdfBuffer = await buildCertificatePdf(certData, verificationHash, bocwReference, verificationUrl, qrPng);
+  const printedLink = credential ? `${config.portalUrl}/verify (scan the QR code)` : verificationUrl;
+  const pdfBuffer = await buildCertificatePdf(certData, verificationHash, bocwReference, printedLink, qrPng);
 
   // Upload PDF to certificates S3 bucket
   const s3Key = `certificates/${workerId}/${certificateId}.pdf`;
@@ -196,6 +215,10 @@ async function issueCertificate(workerId, certificateId) {
     'application/pdf',
     { worker_id: workerId, certificate_id: certificateId },
   );
+
+  // QR as a standalone image, sent to the worker on WhatsApp to show the officer
+  const qrS3Key = `certificates/${workerId}/${certificateId}-qr.png`;
+  await uploadToS3(config.buckets.certificates, qrS3Key, qrPng, 'image/png', { worker_id: workerId, certificate_id: certificateId });
 
   // Store in Certificates table, with a snapshot of the worker's identity as printed on the PDF
   // (the verify endpoint shows these, even if the worker record changes later)
@@ -211,6 +234,8 @@ async function issueCertificate(workerId, certificateId) {
     sites: sitesWorked,
     pdf_s3_key: s3Key,
     qr_code_data: verificationUrl,
+    qr_s3_key: qrS3Key,
+    credential_jwt: credential ? credential.token : null,
     bocw_reference: bocwReference,
     created_at: new Date().toISOString(),
   };
@@ -234,7 +259,9 @@ async function issueCertificate(workerId, certificateId) {
     sitesWorked,
     downloadUrl,
     pdfS3Key: s3Key,
+    qrS3Key,
     verificationUrl,
+    signedCredential: Boolean(credential),
     workerName,
   };
 }
@@ -372,7 +399,7 @@ function buildCertificatePdf(certData, verificationHash, bocwReference, verifica
     y += 20;
 
     // --- QR Code ---
-    const qrBoxSize = 90;
+    const qrBoxSize = 140;
     const qrX = centerX - qrBoxSize / 2;
     doc.image(qrPng, qrX, y, { width: qrBoxSize, height: qrBoxSize });
 
