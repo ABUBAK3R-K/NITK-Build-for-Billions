@@ -261,7 +261,7 @@ async function processGeoVerification(event) {
 // ---------------------------------------------------------
 
 async function processVoiceVerification(event) {
-  const { voiceTranscription, language } = event;
+  const { voiceTranscription, language, passcode } = event;
 
   if (!voiceTranscription || voiceTranscription.length < 3) {
     return { success: false, confidence: 0, reason: 'no_voice_data', workDetails: null };
@@ -280,7 +280,10 @@ async function processVoiceVerification(event) {
     };
   }
 
-  const prompt = `You are analyzing a voice note from an Indian construction worker who is logging their daily attendance. The worker described their work in ${languageName(language)}.
+  const passcodeInstruction = passcode ? 
+    `\n\nCRITICAL FRAUD CHECK: The worker was instructed to say the number "${passcode}". Check if this number or its word equivalent is present in the transcription (e.g. if the number is 42, look for "42", "forty two", "bealis", "forty-two", "beayalees").\n5. Did they say the passcode?` : '';
+
+  const prompt = `You are analyzing a voice note from an Indian construction worker who is logging their daily attendance. The worker described their work in ${languageName(language)}.${passcodeInstruction}
 
 Worker's voice transcription: "${voiceTranscription}"
 
@@ -288,10 +291,10 @@ Analyze this and determine:
 1. Is this a genuine work-related check-in (not a fake/scripted message)?
 2. What specific work activity did they describe?
 3. Did they mention any location or site details?
-4. Confidence score (0-100) that this is a legitimate work attendance check-in
+4. Confidence score (0-100) that this is a legitimate work attendance check-in${passcode ? '\n5. Did they say the passcode?' : ''}
 
 Respond in EXACTLY this JSON format (no markdown, no code blocks):
-{"is_work_related": true/false, "activity": "brief description", "location_mention": "any location mentioned or null", "confidence": 0-100, "reasoning": "brief explanation"}`;
+{"is_work_related": true/false, "activity": "brief description", "location_mention": "any location mentioned or null", "confidence": 0-100, "reasoning": "brief explanation"${passcode ? ', "passcode_match": true/false' : ''}}`;
 
   try {
     const response = await complete({ prompt, json: true, maxTokens: 200, cacheTtlSeconds: 86400 });
@@ -299,14 +302,27 @@ Respond in EXACTLY this JSON format (no markdown, no code blocks):
     const result = JSON.parse(jsonStr);
     // The model sometimes answers "false" as a string, which Boolean() would read as true
     const isWorkRelated = result.is_work_related === true || String(result.is_work_related).toLowerCase() === 'true';
+    let confidence = Math.min(100, Math.max(0, Number(result.confidence) || 0));
+    
+    // Passcode enforcement
+    if (passcode) {
+      const passcodeMatch = result.passcode_match === true || String(result.passcode_match).toLowerCase() === 'true';
+      if (!passcodeMatch) {
+        console.warn(`[Anti-Fraud] Passcode mismatch. Expected: ${passcode}, Transcription: ${voiceTranscription}`);
+        confidence = 0;
+        result.reasoning = `Failed passcode check (expected ${passcode}). ` + (result.reasoning || '');
+      }
+      result.passcode_mismatch = !passcodeMatch;
+    }
 
     return {
       success: isWorkRelated,
-      confidence: Math.min(100, Math.max(0, Number(result.confidence) || 0)),
+      confidence: confidence,
       workDetails: {
         activity: String(result.activity || ''),
         location_mention: result.location_mention || null,
         is_work_related: isWorkRelated,
+        passcode_mismatch: result.passcode_mismatch || false,
       },
     };
   } catch (err) {
@@ -386,6 +402,16 @@ async function processMergeDecision(event) {
     flaggedReasons.push(`Face confidence in review range: ${Math.round(faceConfidence)}%`);
   }
 
+  // Anti-Fraud: Screen spoofing (Phase 3.2)
+  const sharpness = faceResult?.details?.qualitySharpness;
+  const brightness = faceResult?.details?.qualityBrightness;
+  if (sharpness !== undefined && sharpness < 30) {
+    flaggedReasons.push(`Low image sharpness (possible screen spoof): ${sharpness}`);
+  }
+  if (brightness !== undefined && (brightness < 20 || brightness > 90)) {
+    flaggedReasons.push(`Abnormal brightness (possible glare/spoof): ${brightness}`);
+  }
+
   // GPS rules
   const distance = geoResult?.distance ?? null;
   if (distance !== null) {
@@ -402,6 +428,8 @@ async function processMergeDecision(event) {
   // Voice rules
   if (!voiceResult?.workDetails?.is_work_related) {
     flaggedReasons.push('Voice note not work-related');
+  } else if (voiceResult?.workDetails?.passcode_mismatch) {
+    flaggedReasons.push('Passcode check failed');
   }
 
   // Off-hours check
@@ -412,11 +440,11 @@ async function processMergeDecision(event) {
 
   // Apply confidence routing
   // Off-hours is a flag only — it does not block auto-approval if scores are high
-  const hasHardFail = faceConfidence < 30 || (distance !== null && distance > (geoResult?.nearestSite?.radius || 500) * 2);
+  const hasHardFail = faceConfidence < 30 || (distance !== null && distance > (geoResult?.nearestSite?.radius || 500) * 2) || (voiceResult?.workDetails?.passcode_mismatch === true);
 
   if (hasHardFail) {
     verificationStatus = 'rejected';
-  } else if (faceConfidence >= 60 && geoConfidence >= 60) {
+  } else if (faceConfidence >= 60 && geoConfidence >= 60 && !flaggedReasons.some(r => r.includes('spoof'))) {
     verificationStatus = 'auto_approved';
   } else {
     verificationStatus = 'pending_review';
@@ -440,6 +468,7 @@ async function processMergeDecision(event) {
     voice_details: voiceResult?.workDetails || null,
     flagged_reason: flaggedReasons.join(' | ') || null,
     is_off_hours: isOffHours,
+    image_hash: event.imageHash || null,
     created_at: timestamp,
   };
 
