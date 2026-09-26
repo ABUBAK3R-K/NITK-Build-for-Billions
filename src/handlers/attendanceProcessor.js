@@ -19,6 +19,7 @@ import {
   getItem,
   queryItems,
   incrementDaysLogged,
+  updateWorkerReminderState,
 } from '../utils/dynamodb.js';
 import { downloadFromS3, uploadToS3, enrolledSelfieKey } from '../utils/s3.js';
 import { putItemIfAbsent } from '../services/conditionalWrite.js';
@@ -454,6 +455,12 @@ async function processMergeDecision(event) {
   if (!written) {
     return duplicate('logged_concurrently');
   }
+
+  // Update check-in date and set up next reminder (tomorrow at 18:00 IST / 12:30 UTC)
+  const tomorrow = new Date();
+  tomorrow.setUTCDate(tomorrow.getUTCDate() + 1);
+  tomorrow.setUTCHours(12, 30, 0, 0);
+  await updateWorkerReminderState(workerId, logDate, tomorrow.toISOString());
 
   // If auto-approved, increment the worker's total days
   let totalDaysLogged = worker.total_days_logged || 0;

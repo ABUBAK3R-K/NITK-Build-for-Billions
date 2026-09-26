@@ -553,12 +553,17 @@ export async function finalizeRegistration(workerId, language = 'hi') {
   const worker = await getItem(config.tables.workers, { worker_id: workerId });
   const workerName = worker?.name || '';
 
+  // Set initial reminder time for tomorrow 18:00 IST (12:30 UTC)
+  const tomorrow = new Date();
+  tomorrow.setUTCDate(tomorrow.getUTCDate() + 1);
+  tomorrow.setUTCHours(12, 30, 0, 0);
+
   // Update profile status
   await updateItem(
     config.tables.workers,
     { worker_id: workerId },
-    'SET profile_status = :status, registration_completed = :ts, updated_at = :ts2',
-    { ':status': 'active', ':ts': now, ':ts2': now },
+    'SET profile_status = :status, registration_completed = :ts, updated_at = :ts2, next_reminder_time = :nt, last_checkin_date = :ld',
+    { ':status': 'active', ':ts': now, ':ts2': now, ':nt': tomorrow.toISOString(), ':ld': '1970-01-01' },
   );
 
   // Clear the onboarding step so the next message starts the attendance flow cleanly

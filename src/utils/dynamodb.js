@@ -392,6 +392,26 @@ export async function incrementDaysLogged(workerId) {
   );
 }
 
+/** Update worker reminder state after a check-in */
+export async function updateWorkerReminderState(workerId, lastCheckinDate, nextReminderTime) {
+  return updateItem(
+    config.tables.workers,
+    { worker_id: workerId },
+    'SET last_checkin_date = :ld, next_reminder_time = :nt',
+    { ':ld': lastCheckinDate, ':nt': nextReminderTime },
+  );
+}
+
+/** Update only the next reminder time (used by the cron job) */
+export async function updateWorkerReminderTime(workerId, nextReminderTime) {
+  return updateItem(
+    config.tables.workers,
+    { worker_id: workerId },
+    'SET next_reminder_time = :nt',
+    { ':nt': nextReminderTime },
+  );
+}
+
 export default {
   putItem,
   getItem,
@@ -406,4 +426,6 @@ export default {
   getWorkerAttendanceLogs,
   getPendingReviews,
   incrementDaysLogged,
+  updateWorkerReminderState,
+  updateWorkerReminderTime,
 };

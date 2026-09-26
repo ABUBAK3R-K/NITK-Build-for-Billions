@@ -141,6 +141,37 @@ export async function sendDocumentMessage(phoneNumber, docUrl, filename, caption
 }
 
 /**
+ * Send a template message via WhatsApp
+ * @param {string} phoneNumber
+ * @param {string} templateName
+ * @param {string} languageCode
+ */
+export async function sendTemplateMessage(phoneNumber, templateName, languageCode = 'en') {
+  const payload = {
+    messaging_product: 'whatsapp',
+    to: phoneNumber,
+    type: 'template',
+    template: {
+      name: templateName,
+      language: { code: languageCode },
+    },
+  };
+
+  if (isDemoMode() || noWhatsAppToken()) {
+    console.log(`[WhatsApp STUB] Template → ${phoneNumber}: ${templateName} (${languageCode})`);
+    return { success: true, demo: true, messageId: `demo-${Date.now()}` };
+  }
+
+  try {
+    const response = await axios.post(apiUrl(), payload, { headers: headers() });
+    return { success: true, messageId: response.data.messages?.[0]?.id };
+  } catch (err) {
+    console.error('[WhatsApp] sendTemplateMessage failed:', err.response?.status, JSON.stringify(err.response?.data));
+    throw err;
+  }
+}
+
+/**
  * Send a location request message via WhatsApp
  * Shows a "Send Location" button — worker just taps it, no typing needed.
  * @param {string} phoneNumber
@@ -386,6 +417,7 @@ export default {
   sendAudioMessage,
   sendImageMessage,
   sendDocumentMessage,
+  sendTemplateMessage,
   sendLocationRequest,
   downloadMedia,
   validateMetaSignature,
