@@ -32,12 +32,13 @@ after(() => H.close());
 
 // ── Consent ────────────────────────────────────────────
 
-test('a new worker gets the purpose notice with an I agree button before anything else', async () => {
+test('a new worker gets the purpose notice with an I agree button, read aloud, before anything else', async () => {
   const phone = '919600000001';
   const r = await send(phone, M.text('Namaste'));
-  assert.equal(r.replies.length, 1);
+  assert.deepEqual(r.replies.map((x) => x.split(' ')[0]), ['[buttons]', '[audio]']);
   assert.match(r.replies[0], /^\[buttons\] Nirman Mitra/);
-  const button = H.wa.sent.at(-1).interactive.action.buttons[0].reply;
+  assert.ok(r.replies[0].length < 300, 'notice stays short');
+  const button = H.wa.sent.find((m) => m.interactive).interactive.action.buttons[0].reply;
   assert.deepEqual(button, { id: 'consent_agree', title: 'Main sahmat hoon' });
 
   const w = H.worker(phone);
@@ -92,7 +93,7 @@ test('an existing worker without consent must agree before the next check-in is 
   });
 
   const r = await send(phone, M.image('selfie'));
-  assert.match(r.replies.at(-1), /^\[buttons\]/);
+  assert.ok(r.replies.some((x) => x.startsWith('[buttons]')), 'notice shown');
   assert.equal(logsFor('W-LEGACY').length, 0);
   assert.equal(stepOf('W-LEGACY'), undefined, 'no check-in started');
 
@@ -109,6 +110,25 @@ test('a language switch before agreeing re-sends the notice in that language', a
   assert.equal(H.worker(phone).preferred_language, 'kn');
   assert.deepEqual(r.replies, [`[buttons] ${KN.consentNotice}`]);
   assert.equal(H.worker(phone).consent_version, undefined, 'switching is not agreeing');
+});
+
+test('a saved worker greeting in Hindi or Kannada gets the notice in that language', async () => {
+  const phone = '919600000006';
+  await db.putItem(config.tables.workers, {
+    worker_id: 'W-LEGACY-EN', phone_number: phone, name: 'Asha', preferred_language: 'en', profile_status: 'active',
+  });
+  const { KN } = await import('../src/utils/i18n.js');
+
+  const hi = await send(phone, M.text('namaste'));
+  assert.equal(H.worker(phone).preferred_language, 'hi');
+  assert.match(hi.replies[0], /Main sahmat hoon/);
+
+  const kn = await send(phone, M.text('Namaskara'));
+  assert.equal(H.worker(phone).preferred_language, 'kn');
+  assert.equal(kn.replies[0], `[buttons] ${KN.consentNotice}`);
+
+  await send(phone, M.text('hi'));
+  assert.equal(H.worker(phone).preferred_language, 'kn', 'an English greeting keeps the saved language');
 });
 
 // ── Officer API ────────────────────────────────────────

@@ -168,6 +168,29 @@ const DEDUP_TTL_SECONDS = 2 * 24 * 60 * 60;
 // Selfie, location and voice note must all arrive within this window
 const CHECKIN_WINDOW_MS = 10 * 60 * 1000;
 
+/** One-time two-digit number the worker must say in the check-in voice note */
+function newPasscode() {
+  return Math.floor(Math.random() * 90) + 10;
+}
+
+const VOICE_PROMPT_OPENINGS = {
+  location: { en: 'Location received! ', hi: 'Location mil gaya! ', kn: 'ಸ್ಥಳ ಸ್ವೀಕರಿಸಲಾಗಿದೆ! ' },
+  selfie: { en: 'Selfie received! ', hi: 'Selfie mil gaya! ', kn: 'ಸೆಲ್ಫಿ ಸ್ವೀಕರಿಸಲಾಗಿದೆ! ' },
+};
+
+/**
+ * The check-in voice request, always with the one-time number. Skipping is still accepted
+ * (it goes to review) but is not advertised, since only a spoken note can auto-approve.
+ */
+function voicePromptText(language, passcode, opening) {
+  const lead = opening ? t(language, opening) : '';
+  return lead + t(language, {
+    en: `Now hold the mic button and tell us:\n• What work did you do today?\n• Which floor or area?\n• Please say the number "${passcode}"\n\nExample: "Today I did painting on 3rd floor, ${passcode}"`,
+    hi: `Ab mic button dabake bataiye:\n• Aaj kya kaam kiya?\n• Kaun si jagah pe?\n• Kripya number "${passcode}" boliye\n\nJaise: "Aaj maine 3rd floor pe painting ka kaam kiya, ${passcode}"`,
+    kn: `ಈಗ ಮೈಕ್ ಬಟನ್ ಒತ್ತಿ ಹಿಡಿದು ಹೇಳಿ:\n• ಇಂದು ನೀವು ಯಾವ ಕೆಲಸ ಮಾಡಿದ್ದೀರಿ?\n• ಯಾವ ಮಹಡಿ ಅಥವಾ ಪ್ರದೇಶ?\n• ದಯವಿಟ್ಟು "${passcode}" ಸಂಖ್ಯೆಯನ್ನು ಹೇಳಿ\n\nಉದಾಹರಣೆಗೆ: "ಇಂದು ನಾನು 3ನೇ ಮಹಡಿಯಲ್ಲಿ ಪೇಂಟಿಂಗ್ ಮಾಡಿದ್ದೇನೆ, ${passcode}"`,
+  });
+}
+
 /** Handle every message in a webhook payload (Meta may batch several into one POST) */
 async function handleIncomingMessages(body) {
   const messages = parseWebhookMessages(body);
@@ -327,10 +350,22 @@ async function handleNewWorker(phoneNumber, message) {
 // Consent gate (PRD FR-1): nothing is collected before "I agree"
 // ─────────────────────────────────────────────────────────
 
-async function handleConsentGate(worker, message, switchTo) {
+// A regional greeting before consent picks the notice language, as it does for a new number.
+// English greetings ("hi") keep the saved language, since Hindi speakers type them too.
+const GREETING_LANGUAGES = [
+  ['kn', /^\s*(namaskara|ನಮಸ್ಕಾರ)/iu],
+  ['hi', /^\s*(namaste|namaskar|नमस्ते|नमस्कार)/iu],
+];
+
+function greetingLanguage(text) {
+  return GREETING_LANGUAGES.find(([, pattern]) => pattern.test(text || ''))?.[0] || null;
+}
+
+async function handleConsentGate(worker, message, explicitSwitch) {
   const phoneNumber = message.from;
   const workerId = worker.worker_id;
   let language = worker.preferred_language || 'hi';
+  const switchTo = explicitSwitch || (message.type === 'text' ? greetingLanguage(message.text) : null);
 
   if (switchTo && switchTo !== language) {
     language = switchTo;
@@ -749,19 +784,16 @@ async function handleActiveWorker(workerId, worker, message) {
     if (attendanceStep === 'awaiting_location' && state?.pending_selfie_key) {
       const lower = (message.text || '').toLowerCase().trim();
       if (/\b(ok|skip|done|haan|bas)\b/.test(lower)) {
-        // Skip location, go to voice request
+        // Skip location, go to voice request (a skipped location goes to review)
+        const passcode = newPasscode();
         await saveConversationState(workerId, workerId, {
           ...state,
           current_step: 'awaiting_voice',
           pending_latitude: null,
           pending_longitude: null,
+          passcode,
         });
-        const voiceText = t(language, {
-          en: 'Now hold the mic button and tell us:\n• What work did you do today?\n• Which floor or area?\n\nExample: "Today I did painting work on 3rd floor"\n\nOr send "ok" to skip.',
-          hi: 'Ab mic button dabake bataiye:\n• Aaj kya kaam kiya?\n• Kaun si jagah pe?\n\nJaise: "Aaj maine 3rd floor pe painting ka kaam kiya"\n\nYa "ok" bhejiye skip karne ke liye.',
-          kn: KN.voiceAskAfterSkip,
-        });
-        await sendTextMessage(phoneNumber, voiceText);
+        await sendTextMessage(phoneNumber, voicePromptText(language, passcode, null));
         return apiResponse(200, { status: 'location_skipped_awaiting_voice', workerId });
       }
     }
@@ -780,22 +812,17 @@ async function handleActiveWorker(workerId, worker, message) {
   if (message.type === 'location') {
     // Accept location if we have a pending selfie (in awaiting_location OR awaiting_voice state)
     if (state?.pending_selfie_key && (attendanceStep === 'awaiting_location' || attendanceStep === 'awaiting_voice')) {
-      const passcode = Math.floor(Math.random() * 90) + 10; // 10 to 99
-      
+      const passcode = newPasscode();
+
       // Store location, move to voice step
       await saveConversationState(workerId, workerId, {
         ...state,
         current_step: 'awaiting_voice',
         pending_latitude: message.latitude,
         pending_longitude: message.longitude,
-        passcode: passcode,
+        passcode,
       });
-      const voiceText = t(language, {
-        en: `Location received! Now hold the mic button and tell us:\n• What work did you do today?\n• Which floor or area?\n• Please say the number "${passcode}"\n\nExample: "Today I did painting on 3rd floor, ${passcode}"\n\nOr send "ok" to skip.`,
-        hi: `Location mil gaya! Ab mic button dabake bataiye:\n• Aaj kya kaam kiya?\n• Kaun si jagah pe?\n• Kripya number "${passcode}" boliye\n\nJaise: "Aaj maine 3rd floor pe painting ka kaam kiya, ${passcode}"\n\nYa "ok" bhejiye skip karne ke liye.`,
-        kn: `ಸ್ಥಳ ಸ್ವೀಕರಿಸಲಾಗಿದೆ! ಈಗ ಮೈಕ್ ಬಟನ್ ಒತ್ತಿ ಹಿಡಿದು ಹೇಳಿ:\n• ಇಂದು ನೀವು ಯಾವ ಕೆಲಸ ಮಾಡಿದ್ದೀರಿ?\n• ಯಾವ ಮಹಡಿ ಅಥವಾ ಪ್ರದೇಶ?\n• ದಯವಿಟ್ಟು "${passcode}" ಸಂಖ್ಯೆಯನ್ನು ಹೇಳಿ\n\nಉದಾಹರಣೆಗೆ: "ಇಂದು ನಾನು 3ನೇ ಮಹಡಿಯಲ್ಲಿ ಪೇಂಟಿಂಗ್ ಮಾಡಿದ್ದೇನೆ, ${passcode}"\n\nಅಥವಾ ಸ್ಕಿಪ್ ಮಾಡಲು "ok" ಕಳುಹಿಸಿ.`,
-      });
-      await sendTextMessage(phoneNumber, voiceText);
+      await sendTextMessage(phoneNumber, voicePromptText(language, passcode, VOICE_PROMPT_OPENINGS.location));
       return apiResponse(200, { status: 'location_stored_awaiting_voice', workerId });
     }
     // Location without prior selfie
@@ -1419,21 +1446,18 @@ async function handleSelfiePendingLocation(workerId, worker, message, language) 
     } catch (err) {
       // If location_request_message not supported, skip to voice step
       console.warn('[Attendance] Location request failed, skipping to voice step:', err.message);
+      const passcode = newPasscode();
       await saveConversationState(workerId, workerId, {
         current_step: 'awaiting_voice',
         pending_selfie_key: uploadResult.key,
         pending_selfie_hash: imageHash,
+        pending_selfie_at: Date.now(),
         pending_latitude: null,
         pending_longitude: null,
-        passcode: null,
+        passcode,
         preferred_language: language,
       });
-      const voiceText = t(language, {
-        en: 'Selfie received! Hold the mic button and tell us:\n• What work did you do today?\n• Which floor or area?\n\nExample: "Today I did painting work on 3rd floor"\n\nOr send "ok" to skip.',
-        hi: 'Selfie mil gaya! Mic button dabake bataiye:\n• Aaj kya kaam kiya?\n• Kaun si jagah pe?\n\nJaise: "Aaj maine 3rd floor pe painting ka kaam kiya"\n\nYa "ok" bhejiye skip karne ke liye.',
-        kn: KN.voiceAskAfterSelfie,
-      });
-      await sendTextMessage(phoneNumber, voiceText);
+      await sendTextMessage(phoneNumber, voicePromptText(language, passcode, VOICE_PROMPT_OPENINGS.selfie));
     }
 
     return apiResponse(200, { status: 'selfie_stored_awaiting_location', workerId });
