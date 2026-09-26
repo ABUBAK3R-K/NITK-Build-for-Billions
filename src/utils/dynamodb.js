@@ -78,7 +78,9 @@ const mockDb = {
           ? { token_id: item.token_id }
           : item.site_id !== undefined
             ? { site_id: item.site_id }
-            : { _id: JSON.stringify(item) });
+            : item.subject !== undefined
+              ? { subject: item.subject, entry_id: item.entry_id }
+              : { _id: JSON.stringify(item) });
     if (conditionExpression && !mockConditionHolds(store.get(key), conditionExpression, expressionValues, expressionNames)) {
       throw conditionalCheckFailed();
     }

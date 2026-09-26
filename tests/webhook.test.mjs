@@ -20,6 +20,7 @@ after(() => H.close());
 
 async function onboard(phone) {
   await send(phone, M.text('Namaste'));
+  await H.agree(phone);
   await send(phone, M.text('Ram Kumar'));
   await send(phone, M.image('a1'));
   await send(phone, M.image('s1'));
@@ -85,6 +86,7 @@ test('an LLM-returned demo intent is treated as help', async () => {
 test('a failed transcription never becomes the worker name', async () => {
   const phone = '919100000300';
   await send(phone, M.text('Namaste'));
+  await H.agree(phone);
   H.transcribe.fail = true;
   try {
     await send(phone, M.audio('n1'));

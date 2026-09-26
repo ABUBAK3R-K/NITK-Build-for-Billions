@@ -72,9 +72,11 @@ async function ensureCollection() {
  * Detects language, checks for duplicates, creates worker record.
  * @param {string} phoneNumber - International phone number
  * @param {string} messageText - First message content (e.g., "Hi", "Namaste")
- * @returns {Promise<{workerId: string, language: string, isExisting: boolean, responseText: string, audioUrl: string|null}>}
+ * @param {object} [options]
+ * @param {boolean} [options.awaitConsent] - Start at the consent step; no greeting is generated
+ * @returns {Promise<{workerId: string, language: string, isExisting: boolean, responseText: string|null, audioUrl: string|null}>}
  */
-export async function handleGreeting(phoneNumber, messageText) {
+export async function handleGreeting(phoneNumber, messageText, { awaitConsent = false } = {}) {
   // Detect language from greeting
   const language = await detectLanguage(messageText || 'Hi');
 
@@ -115,10 +117,14 @@ export async function handleGreeting(phoneNumber, messageText) {
   // attendance flow, so a stale onboarding row can never shadow a later check-in step.
   const sessionId = workerId;
   await saveConversationState(workerId, sessionId, {
-    current_step: 'awaiting_name',
+    current_step: awaitConsent ? 'awaiting_consent' : 'awaiting_name',
     preferred_language: language,
     retry_count: 0,
   });
+
+  if (awaitConsent) {
+    return { workerId, language, isExisting: false, sessionId, responseText: null, audioUrl: null };
+  }
 
   // Generate greeting voice response
   const responseText = getGreetingMessage(language);

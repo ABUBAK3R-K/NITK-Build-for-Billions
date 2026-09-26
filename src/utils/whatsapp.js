@@ -174,6 +174,42 @@ export async function sendLocationRequest(phoneNumber, text) {
 }
 
 /**
+ * Send a message with up to 3 quick-reply buttons. A tap comes back as an interactive
+ * button_reply, which parseMessage turns into text plus buttonId.
+ * @param {string} phoneNumber
+ * @param {string} text - Body text (max 1024 chars)
+ * @param {Array<{id: string, title: string}>} buttons - Titles max 20 chars
+ */
+export async function sendReplyButtons(phoneNumber, text, buttons) {
+  const payload = {
+    messaging_product: 'whatsapp',
+    recipient_type: 'individual',
+    to: phoneNumber,
+    type: 'interactive',
+    interactive: {
+      type: 'button',
+      body: { text },
+      action: {
+        buttons: buttons.slice(0, 3).map((b) => ({ type: 'reply', reply: { id: b.id, title: b.title.slice(0, 20) } })),
+      },
+    },
+  };
+
+  if (isDemoMode() || noWhatsAppToken()) {
+    console.log(`[WhatsApp STUB] Buttons → ${phoneNumber}: ${text} [${buttons.map((b) => b.title).join(' | ')}]`);
+    return { success: true, demo: true, messageId: `demo-${Date.now()}` };
+  }
+
+  try {
+    const response = await axios.post(apiUrl(), payload, { headers: headers() });
+    return { success: true, messageId: response.data.messages?.[0]?.id };
+  } catch (err) {
+    console.error('[WhatsApp] sendReplyButtons failed:', err.response?.status, JSON.stringify(err.response?.data));
+    throw err;
+  }
+}
+
+/**
  * Download media from WhatsApp by media ID
  * Used when workers send images/audio — fetch the binary content.
  * @param {string} mediaId - WhatsApp media ID from webhook payload
@@ -327,6 +363,7 @@ export default {
   sendImageMessage,
   sendDocumentMessage,
   sendLocationRequest,
+  sendReplyButtons,
   downloadMedia,
   validateMetaSignature,
   parseWebhookMessage,

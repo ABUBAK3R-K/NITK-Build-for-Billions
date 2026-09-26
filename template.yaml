@@ -131,6 +131,7 @@ Globals:
         ADMIN_SEED_SECRET: !Ref AdminSeedSecret
         ADMIN_USERS_TABLE: !Ref AdminUsersTable
         REFRESH_TOKENS_TABLE: !Ref RefreshTokensTable
+        AUDIT_TABLE: !Ref AuditLogTable
         REKOGNITION_COLLECTION_ID: nirman-mitra-workers
         BEDROCK_CACHE_TABLE: !Ref BedrockCacheTable
         LLM_PROVIDER: groq
@@ -333,6 +334,33 @@ Resources:
               KeyType: HASH
           Projection:
             ProjectionType: ALL
+        - IndexName: CertificateIdIndex
+          KeySchema:
+            - AttributeName: certificate_id
+              KeyType: HASH
+          Projection:
+            ProjectionType: KEYS_ONLY
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  # Append-only: functions get PutItem/GetItem/Query on it, never UpdateItem or DeleteItem
+  AuditLogTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub 'NirmanMitra-AuditLog-${Environment}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: subject
+          AttributeType: S
+        - AttributeName: entry_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: subject
+          KeyType: HASH
+        - AttributeName: entry_id
+          KeyType: RANGE
       PointInTimeRecoverySpecification:
         PointInTimeRecoveryEnabled: true
 
@@ -558,6 +586,10 @@ Resources:
             - Effect: Allow
               Action: [transcribe:StartTranscriptionJob, transcribe:GetTranscriptionJob]
               Resource: '*'
+        - Statement:
+            - Effect: Allow
+              Action: [dynamodb:PutItem, dynamodb:GetItem, dynamodb:Query]
+              Resource: !GetAtt AuditLogTable.Arn
 
   AttendanceProcessorFunction:
     Type: AWS::Serverless::Function
@@ -758,6 +790,24 @@ Resources:
             RestApiId: !Ref NirmanMitraApi
             Path: /api/admin/sites
             Method: POST
+        OfficerView:
+          Type: Api
+          Properties:
+            RestApiId: !Ref NirmanMitraApi
+            Path: /api/officer/view
+            Method: POST
+        OfficerDecision:
+          Type: Api
+          Properties:
+            RestApiId: !Ref NirmanMitraApi
+            Path: /api/officer/approve
+            Method: POST
+        CredentialAudit:
+          Type: Api
+          Properties:
+            RestApiId: !Ref NirmanMitraApi
+            Path: /api/officer/credential/{jti}/audit
+            Method: GET
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref WorkersTable
@@ -773,6 +823,10 @@ Resources:
             TableName: !Ref AdminUsersTable
         - DynamoDBCrudPolicy:
             TableName: !Ref RefreshTokensTable
+        - Statement:
+            - Effect: Allow
+              Action: [dynamodb:PutItem, dynamodb:GetItem, dynamodb:Query]
+              Resource: !GetAtt AuditLogTable.Arn
 
   # ─────────────────────────────────────────────────────────
   # STEP FUNCTIONS

@@ -28,6 +28,24 @@ function DecisionPanel({ credentialId }) {
     const [note, setNote] = useState('');
     const [state, setState] = useState({ status: 'idle', message: '' });
 
+    // Every officer view goes into the audit log (PRD FR-7). Validity was already decided in the
+    // browser; this call only records who looked, and returns any decision already made.
+    useEffect(() => {
+        if (!isAuthenticated || !credentialId) return;
+        let cancelled = false;
+        api.post('/api/officer/view', { jti: credentialId })
+            .then((res) => (res.ok ? res.json() : null))
+            .then((body) => {
+                const previous = body?.decision;
+                if (!cancelled && previous) {
+                    const when = new Date(previous.at).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' });
+                    setState({ status: 'done', message: `This claim was already ${previous.decision === 'approve' ? 'approved' : 'rejected'} on ${when}.` });
+                }
+            })
+            .catch(() => {});
+        return () => { cancelled = true; };
+    }, [isAuthenticated, credentialId]);
+
     if (!isAuthenticated) {
         return (
             <div className="card" style={RESULT_STYLE}>
