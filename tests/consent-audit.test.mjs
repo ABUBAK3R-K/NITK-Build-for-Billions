@@ -32,12 +32,13 @@ after(() => H.close());
 
 // ── Consent ────────────────────────────────────────────
 
-test('a new worker gets the purpose notice with an I agree button before anything else', async () => {
+test('a new worker gets the purpose notice with an I agree button, read aloud, before anything else', async () => {
   const phone = '919600000001';
   const r = await send(phone, M.text('Namaste'));
-  assert.equal(r.replies.length, 1);
+  assert.deepEqual(r.replies.map((x) => x.split(' ')[0]), ['[buttons]', '[audio]']);
   assert.match(r.replies[0], /^\[buttons\] Nirman Mitra/);
-  const button = H.wa.sent.at(-1).interactive.action.buttons[0].reply;
+  assert.ok(r.replies[0].length < 300, 'notice stays short');
+  const button = H.wa.sent.find((m) => m.interactive).interactive.action.buttons[0].reply;
   assert.deepEqual(button, { id: 'consent_agree', title: 'Main sahmat hoon' });
 
   const w = H.worker(phone);
@@ -92,7 +93,7 @@ test('an existing worker without consent must agree before the next check-in is 
   });
 
   const r = await send(phone, M.image('selfie'));
-  assert.match(r.replies.at(-1), /^\[buttons\]/);
+  assert.ok(r.replies.some((x) => x.startsWith('[buttons]')), 'notice shown');
   assert.equal(logsFor('W-LEGACY').length, 0);
   assert.equal(stepOf('W-LEGACY'), undefined, 'no check-in started');
 

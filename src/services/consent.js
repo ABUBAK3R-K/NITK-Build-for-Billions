@@ -7,7 +7,8 @@
 
 import config from '../utils/config.js';
 import { updateItem } from '../utils/dynamodb.js';
-import { sendReplyButtons } from '../utils/whatsapp.js';
+import { sendReplyButtons, sendAudioMessage } from '../utils/whatsapp.js';
+import { generateAndUploadVoice } from './voiceProcessor.js';
 import { t, KN } from '../utils/i18n.js';
 import { writeAudit, workerSubject } from './audit.js';
 
@@ -30,22 +31,32 @@ export function isConsentReply(message) {
 /** Purpose notice text in the worker's language */
 export function consentNoticeText(language) {
   return t(language, {
-    en: 'Nirman Mitra helps you build proof of your construction work days, so you can get welfare benefits.\n\n'
-      + 'To do this we collect: your name, the last 4 digits of your Aadhaar (we do not keep the card photo), '
-      + 'a selfie to match your face, your location when you check in, and voice notes about your work.\n\n'
-      + 'We use this only to verify your work days and issue your work certificate. Tap "I agree" to continue.',
-    hi: 'Nirman Mitra aapke construction kaam ke dinon ka saboot banane mein madad karta hai, taaki aapko welfare labh mil sake.\n\n'
-      + 'Iske liye hum lenge: aapka naam, Aadhaar ke aakhri 4 ank (card ki photo hum nahi rakhte), '
-      + 'chehra milane ke liye selfie, check-in ke waqt aapka location, aur aapke kaam ke baare mein voice note.\n\n'
-      + 'Iska upyog sirf aapke kaam ke din verify karne aur work certificate dene ke liye hoga. Aage badhne ke liye "Main sahmat hoon" dabaiye.',
+    en: 'Nirman Mitra keeps proof of your work days so you can get welfare benefits.\n\n'
+      + 'We use your name, last 4 Aadhaar digits, a selfie, your check-in location and voice notes only to verify your work.\n\n'
+      + 'Tap "I agree" to start.',
+    hi: 'Nirman Mitra aapke kaam ke dinon ka saboot rakhta hai, taaki aapko welfare labh mile.\n\n'
+      + 'Aapka naam, Aadhaar ke aakhri 4 ank, selfie, check-in location aur voice note sirf kaam verify karne ke liye lete hain.\n\n'
+      + 'Shuru karne ke liye "Main sahmat hoon" dabaiye.',
     kn: KN.consentNotice,
   });
 }
 
-/** Send the purpose notice with the "I agree" button */
+/**
+ * Send the purpose notice with the "I agree" button, then read it aloud for workers who
+ * cannot read it. The voice note is best effort: the written notice and button always go first.
+ * The recording is stored under a shared prefix, never the worker's, since nothing of theirs is kept before consent.
+ */
 export async function sendConsentNotice(phoneNumber, language) {
   const title = t(language, { en: 'I agree', hi: 'Main sahmat hoon', kn: KN.consentButton });
-  return sendReplyButtons(phoneNumber, consentNoticeText(language), [{ id: CONSENT_BUTTON_ID, title }]);
+  const text = consentNoticeText(language);
+  const sent = await sendReplyButtons(phoneNumber, text, [{ id: CONSENT_BUTTON_ID, title }]);
+  try {
+    const audioUrl = await generateAndUploadVoice('shared', text, language, 'consent-notice');
+    if (audioUrl) await sendAudioMessage(phoneNumber, audioUrl);
+  } catch (err) {
+    console.warn('[Consent] Voice notice failed, text already sent:', err.message);
+  }
+  return sent;
 }
 
 /** Reply when a worker sends something before agreeing */
