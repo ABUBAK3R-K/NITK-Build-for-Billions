@@ -1011,7 +1011,7 @@ export default function LandingPage() {
                                 <h4>Resources</h4>
                                 <ul>
                                     <li><a href="#about">About the Mission</a></li>
-                                    <li><a href="https://github.com/ABUBAK3R-K/NITK-Build-for-Billions" target="_blank" rel="noopener noreferrer">GitHub Repo</a></li>
+                                    <li><a href="https://github.com/ABUBAK3R-K/NITK-Build-for-Billions" target="_blank" rel="noopener noreferrer">GitHub Repo</a></li>
                                 </ul>
                             </div>
 
