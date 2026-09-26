@@ -9,10 +9,11 @@ import {
   RekognitionClient,
   IndexFacesCommand,
   CreateCollectionCommand,
+  DeleteFacesCommand,
 } from '@aws-sdk/client-rekognition';
 import config, { isDemoMode } from '../utils/config.js';
 import { putItem, getItem, updateItem, getWorkerByPhone, saveConversationState } from '../utils/dynamodb.js';
-import { uploadWorkerMedia, uploadToS3 } from '../utils/s3.js';
+import { uploadWorkerMedia, uploadToS3, enrolledSelfieKey } from '../utils/s3.js';
 import { getAadhaarLast4 } from '../utils/aadhaar.js';
 import {
   detectLanguage,
@@ -22,6 +23,7 @@ import {
   getStepPrompt,
 } from './voiceProcessor.js';
 import { withRetry } from '../utils/retryHelper.js';
+import { t, KN } from '../utils/i18n.js';
 import {
   extractAadhaarFields,
   extractBankFields,
@@ -33,6 +35,9 @@ import {
 const IS_DEMO = isDemoMode();
 const rekognitionClient = IS_DEMO ? null : new RekognitionClient({ region: config.aws.region });
 const COLLECTION_ID = config.rekognitionCollectionId;
+
+// Failed Aadhaar photos allowed before the worker is flagged for an admin
+const MAX_AADHAAR_ATTEMPTS = 3;
 
 // ─────────────────────────────────────────────────────────
 // Collection Initialization (one-time)
@@ -76,9 +81,11 @@ export async function handleGreeting(phoneNumber, messageText) {
   // Check for existing worker (duplicate detection via PhoneNumberIndex GSI)
   const existing = await getWorkerByPhone(phoneNumber);
   if (existing) {
-    const responseText = language === 'en'
-      ? `Hello ${existing.name || ''}! You are already registered. Send a selfie and voice note to log attendance.`
-      : `Namaskar ${existing.name || ''}! Aap pehle se registered hain. Attendance log karne ke liye selfie aur voice note bhejiye.`;
+    const responseText = t(language, {
+      en: `Hello ${existing.name || ''}! You are already registered. Send a selfie and voice note to log attendance.`,
+      hi: `Namaskar ${existing.name || ''}! Aap pehle se registered hain. Attendance log karne ke liye selfie aur voice note bhejiye.`,
+      kn: KN.alreadyRegistered(existing.name || ''),
+    });
     const audioUrl = await generateAndUploadVoice(existing.worker_id, responseText, language, 'already-registered');
     return {
       workerId: existing.worker_id,
@@ -104,8 +111,9 @@ export async function handleGreeting(phoneNumber, messageText) {
     updated_at: now,
   });
 
-  // Create conversation state
-  const sessionId = uuidv4();
+  // Create conversation state. One row per worker (session_id = workerId), shared with the
+  // attendance flow, so a stale onboarding row can never shadow a later check-in step.
+  const sessionId = workerId;
   await saveConversationState(workerId, sessionId, {
     current_step: 'awaiting_name',
     preferred_language: language,
@@ -143,7 +151,7 @@ export async function handleNameCapture(workerId, audioBuffer, textMessage, lang
 
   if (audioBuffer && audioBuffer.length > 100) {
     // Transcribe voice note
-    name = await transcribeVoice(audioBuffer, language);
+    name = await transcribeVoice(audioBuffer, language, workerId);
   } else if (textMessage) {
     name = textMessage.trim();
   } else {
@@ -155,7 +163,7 @@ export async function handleNameCapture(workerId, audioBuffer, textMessage, lang
 
   // Clean up the name
   // Allow Unicode letters (Hindi, Tamil, etc.) + spaces + dots
-  name = name.replace(/[^\p{L}\p{M}\s.]/gu, '').trim();
+  name = stripNameLeadIns(name.replace(/[^\p{L}\p{M}\s.]/gu, '').trim());
   if (!name || name.length < 2) {
     const responseText = getStepPrompt('awaiting_name', language);
     const audioUrl = await generateAndUploadVoice(workerId, responseText, language, 'name-retry');
@@ -172,17 +180,57 @@ export async function handleNameCapture(workerId, audioBuffer, textMessage, lang
   );
 
   // Move to next step
-  const responseText = language === 'en'
-    ? `Thank you, ${name}! Now please send a photo of your Aadhaar card.`
-    : `Dhanyavaad, ${name}! Ab kripya apne Aadhaar card ka photo bhejiye.`;
+  const responseText = t(language, {
+    en: `Thank you, ${name}! Now please send a photo of your Aadhaar card.`,
+    hi: `Dhanyavaad, ${name}! Ab kripya apne Aadhaar card ka photo bhejiye.`,
+    kn: KN.nameThanks(name),
+  });
   const audioUrl = await generateAndUploadVoice(workerId, responseText, language, 'name-confirmed');
 
   return { name, responseText, audioUrl, nextStep: 'awaiting_aadhaar' };
 }
 
+// "mera naam Ram Kumar hai" / "my name is Ram" / "main Ram hoon" → the name alone
+const NAME_LEAD_IN = /^(?:(?:mera|meraa|my|मेरा)\s+(?:naam|name|नाम)(?:\s+(?:is|hai|है))?|(?:naam|name|नाम)(?:\s+(?:is|hai|है))?|i\s+am|im|main|mai|मैं)\s+/iu;
+const NAME_TRAILER = /\s+(?:hai|hoon|hun|hu|है|हूँ|हूं|हू)$/iu;
+
+/** Strip common spoken lead-ins and trailing "hai"/"hoon" from a captured name */
+export function stripNameLeadIns(text) {
+  return String(text || '').trim().replace(NAME_LEAD_IN, '').replace(NAME_TRAILER, '').trim();
+}
+
 // ─────────────────────────────────────────────────────────
 // Step 3: Handle Aadhaar Upload
 // ─────────────────────────────────────────────────────────
+
+/**
+ * A failed Aadhaar photo: re-prompt, or flag for an admin once MAX_AADHAAR_ATTEMPTS photos
+ * have failed. retryCount is the number of earlier failed photos.
+ */
+async function aadhaarAttemptFailed(workerId, language, retryCount, responseText, label) {
+  if (retryCount + 1 >= MAX_AADHAAR_ATTEMPTS) {
+    await updateItem(
+      config.tables.workers,
+      { worker_id: workerId },
+      'SET admin_flag = :flag, admin_flag_reason = :reason, updated_at = :ts',
+      {
+        ':flag': true,
+        ':reason': `Aadhaar could not be read after ${MAX_AADHAAR_ATTEMPTS} attempts`,
+        ':ts': new Date().toISOString(),
+      },
+    );
+    const flaggedText = t(language, {
+      en: 'We could not read your Aadhaar card. An admin will review your case and message you here.',
+      hi: 'Aapka Aadhaar card padha nahi ja saka. Admin aapki madad karenge aur yahin message karenge.',
+      kn: KN.aadhaarFlagged,
+    });
+    const audioUrl = await generateAndUploadVoice(workerId, flaggedText, language, 'aadhaar-admin-flag');
+    return { success: false, extractedFields: null, responseText: flaggedText, audioUrl, nextStep: 'admin_flagged' };
+  }
+
+  const audioUrl = await generateAndUploadVoice(workerId, responseText, language, label);
+  return { success: false, extractedFields: null, responseText, audioUrl, nextStep: 'awaiting_aadhaar' };
+}
 
 /**
  * Process Aadhaar card photo: OCR → validate → encrypt → store.
@@ -194,55 +242,40 @@ export async function handleNameCapture(workerId, audioBuffer, textMessage, lang
  * @returns {Promise<{success: boolean, extractedFields: object|null, responseText: string, audioUrl: string|null, nextStep: string}>}
  */
 export async function handleAadhaarUpload(workerId, imageBuffer, language = 'hi', retryCount = 0) {
-  // Check image quality
-  const quality = await assessDocumentQuality(imageBuffer);
+  // OCR runs on the in-memory buffer: the card image is never uploaded or stored
+  let quality;
+  let fields = null;
+  try {
+    quality = await assessDocumentQuality(imageBuffer);
+    if (quality >= 50) fields = await extractAadhaarFields(imageBuffer);
+  } catch (err) {
+    // A Textract outage is not the worker's fault: no retry is consumed
+    console.error('Aadhaar OCR service error:', err.name, err.message);
+    const responseText = t(language, {
+      en: 'We are having a temporary problem reading documents. Please send the Aadhaar photo again in a few minutes.',
+      hi: 'Abhi document padhne mein thodi takleef hai. Kripya kuch minute baad Aadhaar ka photo dobara bhejiye.',
+      kn: KN.aadhaarServiceError,
+    });
+    const audioUrl = await generateAndUploadVoice(workerId, responseText, language, 'aadhaar-service-error');
+    return { success: false, extractedFields: null, responseText, audioUrl, nextStep: 'awaiting_aadhaar', consumesRetry: false };
+  }
+
   if (quality < 50) {
-    if (retryCount >= 3) {
-      // Max retries reached — flag for admin review
-      await updateItem(
-        config.tables.workers,
-        { worker_id: workerId },
-        'SET admin_flag = :flag, admin_flag_reason = :reason, updated_at = :ts',
-        {
-          ':flag': true,
-          ':reason': 'Aadhaar image quality too low after 3 retries',
-          ':ts': new Date().toISOString(),
-        },
-      );
-      const responseText = language === 'en'
-        ? 'We could not read your Aadhaar card. An admin will review your case. Please try again later.'
-        : 'Aapka Aadhaar card padha nahi ja saka. Admin aapki madad karenge. Kripya baad mein koshish karein.';
-      const audioUrl = await generateAndUploadVoice(workerId, responseText, language, 'aadhaar-admin-flag');
-      return { success: false, extractedFields: null, responseText, audioUrl, nextStep: 'admin_flagged' };
-    }
-
-    const responseText = getStepPrompt('retry_image', language);
-    const audioUrl = await generateAndUploadVoice(workerId, responseText, language, 'aadhaar-retry');
-    return { success: false, extractedFields: null, responseText, audioUrl, nextStep: 'awaiting_aadhaar' };
+    return aadhaarAttemptFailed(workerId, language, retryCount, getStepPrompt('retry_image', language), 'aadhaar-retry');
   }
 
-  // Upload raw image to S3
-  const uploadResult = await uploadWorkerMedia(workerId, 'aadhaar', imageBuffer, 'image/jpeg');
-
-  // Extract fields with Textract
-  const fields = await extractAadhaarFields(imageBuffer);
-
-  // Validate Aadhaar number with Verhoeff checksum
-  let aadhaarValid = false;
-  if (fields.aadhaar_number) {
-    aadhaarValid = verhoeffChecksum(fields.aadhaar_number);
-  }
-
-  if (!aadhaarValid && fields.aadhaar_number) {
-    console.warn(`Verhoeff checksum failed for Aadhaar: ${fields.aadhaar_number.slice(-4)}`);
-    // Still proceed but flag it
+  // extractAadhaarFields only returns a number that passes Verhoeff; check again before trusting it
+  if (!fields.aadhaar_number || !verhoeffChecksum(fields.aadhaar_number)) {
+    const responseText = t(language, {
+      en: 'We could not find a valid 12-digit Aadhaar number in the photo. Please send a clear photo of the side with your Aadhaar number.',
+      hi: 'Photo mein sahi 12 ank ka Aadhaar number nahi mila. Kripya Aadhaar number wali taraf ka saaf photo bhejiye.',
+      kn: KN.aadhaarInvalid,
+    });
+    return aadhaarAttemptFailed(workerId, language, retryCount, responseText, 'aadhaar-invalid');
   }
 
   // Keep only the last 4 digits; the full number is never stored
-  let aadhaarLast4 = '';
-  if (fields.aadhaar_number) {
-    aadhaarLast4 = getAadhaarLast4(fields.aadhaar_number);
-  }
+  const aadhaarLast4 = getAadhaarLast4(fields.aadhaar_number);
 
   // Store in Documents table
   const docId = uuidv4();
@@ -258,8 +291,7 @@ export async function handleAadhaarUpload(workerId, imageBuffer, language = 'hi'
       aadhaar_last4: aadhaarLast4,
     },
     ocr_confidence: fields.confidence,
-    verhoeff_valid: aadhaarValid,
-    s3_key: uploadResult.key,
+    verhoeff_valid: true,
     created_at: new Date().toISOString(),
   });
 
@@ -276,9 +308,11 @@ export async function handleAadhaarUpload(workerId, imageBuffer, language = 'hi'
   );
 
   // Success response — move to selfie step
-  const responseText = language === 'en'
-    ? `Aadhaar verified (****${aadhaarLast4})! Now please send a clear selfie photo.`
-    : `Aadhaar verified (****${aadhaarLast4})! Ab kripya apna ek selfie photo bhejiye.`;
+  const responseText = t(language, {
+    en: `Aadhaar verified (****${aadhaarLast4})! Now please send a clear selfie photo.`,
+    hi: `Aadhaar verified (****${aadhaarLast4})! Ab kripya apna ek selfie photo bhejiye.`,
+    kn: KN.aadhaarVerified(aadhaarLast4),
+  });
   const audioUrl = await generateAndUploadVoice(workerId, responseText, language, 'aadhaar-verified');
 
   return {
@@ -307,14 +341,6 @@ export async function handleSelfieCapture(workerId, imageBuffer, language = 'hi'
 
   // Upload to S3 (raw — will be deleted by 90d lifecycle)
   await uploadWorkerMedia(workerId, 'selfie', imageBuffer, 'image/jpeg');
-  // Also save as selfie-latest.jpg for face comparison during attendance
-  await uploadToS3(
-    config.buckets.mediaRaw,
-    `workers/${workerId}/selfie-latest.jpg`,
-    imageBuffer,
-    'image/jpeg',
-    { worker_id: workerId, media_type: 'selfie-latest' },
-  );
 
   try {
     let faceId;
@@ -340,26 +366,58 @@ export async function handleSelfieCapture(workerId, imageBuffer, language = 'hi'
       );
 
       const faceRecords = indexResult.FaceRecords || [];
-      if (faceRecords.length === 0) {
-        const responseText = language === 'en'
-          ? 'No face detected. Please send a clear selfie showing your face.'
-          : 'Chehra dikhai nahi diya. Kripya apna chehra dikhate hue ek clear selfie bhejiye.';
-        const audioUrl = await generateAndUploadVoice(workerId, responseText, language, 'selfie-retry');
+      const unindexedFaces = indexResult.UnindexedFaces || [];
+
+      // Reject the selfie; any face already indexed from it is removed from the collection
+      const rejectSelfie = async (en, hi, kn, label) => {
+        await deleteIndexedFaces(faceRecords.map((r) => r.Face?.FaceId).filter(Boolean));
+        const responseText = t(language, { en, hi, kn });
+        const audioUrl = await generateAndUploadVoice(workerId, responseText, language, label);
         return { success: false, faceId: null, responseText, audioUrl, nextStep: 'awaiting_selfie' };
+      };
+
+      // MaxFaces 1 indexes the largest face and reports the rest as EXCEEDS_MAX_FACES
+      if (faceRecords.length > 1 || unindexedFaces.some((f) => f.Reasons?.includes('EXCEEDS_MAX_FACES'))) {
+        return rejectSelfie(
+          'More than one face is in the photo. Please send a selfie with only your face.',
+          'Photo mein ek se zyada chehre hain. Kripya sirf apne chehre wala selfie bhejiye.',
+          KN.selfieMultipleFaces,
+          'selfie-multiple-faces',
+        );
+      }
+
+      const quality = faceRecords[0]?.FaceDetail?.Quality;
+      // No face indexed but one was detected: QualityFilter dropped it as too dark / blurry
+      if ((faceRecords.length === 0 && unindexedFaces.length > 0)
+        || (quality && (quality.Brightness < 30 || quality.Sharpness < 30))) {
+        return rejectSelfie(
+          'The selfie quality is low. Please take another photo in good lighting.',
+          'Selfie ki quality kam hai. Kripya achchi roshni mein dobara photo lein.',
+          KN.selfieLowQuality,
+          'selfie-quality',
+        );
+      }
+
+      if (faceRecords.length === 0) {
+        return rejectSelfie(
+          'No face detected. Please send a clear selfie showing your face.',
+          'Chehra dikhai nahi diya. Kripya apna chehra dikhate hue ek clear selfie bhejiye.',
+          KN.selfieNoFace,
+          'selfie-retry',
+        );
       }
 
       faceId = faceRecords[0].Face.FaceId;
-      const quality = faceRecords[0].FaceDetail?.Quality;
-
-      // Check quality
-      if (quality && (quality.Brightness < 30 || quality.Sharpness < 30)) {
-        const responseText = language === 'en'
-          ? 'The selfie quality is low. Please take another photo in good lighting.'
-          : 'Selfie ki quality kam hai. Kripya achchi roshni mein dobara photo lein.';
-        const audioUrl = await generateAndUploadVoice(workerId, responseText, language, 'selfie-quality');
-        return { success: false, faceId: null, responseText, audioUrl, nextStep: 'awaiting_selfie' };
-      }
     }
+
+    // Stable reference copy for 1:1 comparison at every check-in (not subject to raw-media expiry)
+    await uploadToS3(
+      config.buckets.mediaRaw,
+      enrolledSelfieKey(workerId),
+      imageBuffer,
+      'image/jpeg',
+      { worker_id: workerId, media_type: 'enrolled-selfie' },
+    );
 
     // Store face ID in Workers table
     await updateItem(
@@ -370,9 +428,11 @@ export async function handleSelfieCapture(workerId, imageBuffer, language = 'hi'
     );
 
     // Move to location step
-    const responseText = language === 'en'
-      ? 'Selfie saved! Now share your work site location.'
-      : 'Selfie save ho gaya! Ab apne kaam ki jagah ka location share karein.';
+    const responseText = t(language, {
+      en: 'Selfie saved! Now share your work site location.',
+      hi: 'Selfie save ho gaya! Ab apne kaam ki jagah ka location share karein.',
+      kn: KN.selfieSaved,
+    });
     const audioUrl = await generateAndUploadVoice(workerId, responseText, language, 'selfie-saved');
 
     return { success: true, faceId, responseText, audioUrl, nextStep: 'awaiting_registration_location' };
@@ -381,6 +441,16 @@ export async function handleSelfieCapture(workerId, imageBuffer, language = 'hi'
     const responseText = getStepPrompt('error', language);
     const audioUrl = await generateAndUploadVoice(workerId, responseText, language, 'selfie-error');
     return { success: false, faceId: null, responseText, audioUrl, nextStep: 'awaiting_selfie' };
+  }
+}
+
+/** Remove faces from the collection (best effort: a leftover face only wastes an index slot) */
+async function deleteIndexedFaces(faceIds) {
+  if (IS_DEMO || faceIds.length === 0) return;
+  try {
+    await rekognitionClient.send(new DeleteFacesCommand({ CollectionId: COLLECTION_ID, FaceIds: faceIds }));
+  } catch (err) {
+    console.warn('[Registration] DeleteFaces failed:', err.message);
   }
 }
 
@@ -444,18 +514,22 @@ export async function handleBankPassbook(workerId, imageBuffer, language = 'hi')
 
     if (!crossValidation.match) {
       // Names don't match — inform worker but still proceed
-      const responseText = language === 'en'
-        ? `Note: The name on your Aadhaar ("${aadhaarName}") differs from your passbook ("${bankName}"). We will proceed, but an admin may verify this. Finalizing your registration...`
-        : `Dhyan dein: Aapke Aadhaar ("${aadhaarName}") aur passbook ("${bankName}") mein naam alag hai. Hum aage badhenge, lekin admin verify kar sakte hain. Registration poora kar rahe hain...`;
+      const responseText = t(language, {
+        en: `Note: The name on your Aadhaar ("${aadhaarName}") differs from your passbook ("${bankName}"). We will proceed, but an admin may verify this. Finalizing your registration...`,
+        hi: `Dhyan dein: Aapke Aadhaar ("${aadhaarName}") aur passbook ("${bankName}") mein naam alag hai. Hum aage badhenge, lekin admin verify kar sakte hain. Registration poora kar rahe hain...`,
+        kn: KN.nameMismatch(aadhaarName, bankName),
+      });
       const audioUrl = await generateAndUploadVoice(workerId, responseText, language, 'name-mismatch');
       return { success: true, crossValidation, responseText, audioUrl, nextStep: 'finalizing' };
     }
   }
 
   // Names match or no names to compare — finalize
-  const responseText = language === 'en'
-    ? 'Bank passbook verified! Finalizing your registration...'
-    : 'Bank passbook verified! Aapka registration poora kar rahe hain...';
+  const responseText = t(language, {
+    en: 'Bank passbook verified! Finalizing your registration...',
+    hi: 'Bank passbook verified! Aapka registration poora kar rahe hain...',
+    kn: KN.passbookVerified,
+  });
   const audioUrl = await generateAndUploadVoice(workerId, responseText, language, 'passbook-verified');
 
   return { success: true, crossValidation, responseText, audioUrl, nextStep: 'finalizing' };
@@ -487,10 +561,18 @@ export async function finalizeRegistration(workerId, language = 'hi') {
     { ':status': 'active', ':ts': now, ':ts2': now },
   );
 
+  // Clear the onboarding step so the next message starts the attendance flow cleanly
+  await saveConversationState(workerId, workerId, {
+    current_step: 'active',
+    preferred_language: language,
+  });
+
   // Generate completion message
-  const responseText = language === 'en'
-    ? `Congratulations ${workerName}! Your registration is complete. You can now log your daily attendance by sending a selfie and voice note.`
-    : `Badhai ho ${workerName}! Aapka registration poora ho gaya. Ab aap har din selfie aur voice note bhejkar apni attendance log kar sakte hain.`;
+  const responseText = t(language, {
+    en: `Congratulations ${workerName}! Your registration is complete. You can now log your daily attendance by sending a selfie and voice note.`,
+    hi: `Badhai ho ${workerName}! Aapka registration poora ho gaya. Ab aap har din selfie aur voice note bhejkar apni attendance log kar sakte hain.`,
+    kn: KN.registrationComplete(workerName),
+  });
   const audioUrl = await generateAndUploadVoice(workerId, responseText, language, 'registration-complete');
 
   return { success: true, responseText, audioUrl };

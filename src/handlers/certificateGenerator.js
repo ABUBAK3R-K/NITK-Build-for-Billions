@@ -15,8 +15,9 @@
 import crypto from 'crypto';
 import { v4 as uuidv4 } from 'uuid';
 import PDFDocument from 'pdfkit';
-import config, { isDemoMode } from '../utils/config.js';
-import { getItem, putItem, queryItems } from '../utils/dynamodb.js';
+import QRCode from 'qrcode';
+import config, { istDate } from '../utils/config.js';
+import { getItem, putItem, queryItems, updateItem } from '../utils/dynamodb.js';
 import { uploadToS3, generatePresignedUrl } from '../utils/s3.js';
 
 export const handler = async (event) => {
@@ -29,7 +30,7 @@ export const handler = async (event) => {
       case 'check_eligibility':
         return await checkEligibility(workerId);
       case 'generate':
-        return await generateCertificate(workerId, event);
+        return await generateCertificate(workerId);
       default:
         return { statusCode: 400, error: `Unknown task: ${task}` };
     }
@@ -43,13 +44,24 @@ export const handler = async (event) => {
 // Check Eligibility
 // ---------------------------------------------------------
 
+function isVerifiedLog(log) {
+  return log.verification_status === 'auto_approved' || log.verification_status === 'approved';
+}
+
 async function checkEligibility(workerId) {
   const worker = await getItem(config.tables.workers, { worker_id: workerId });
   if (!worker) {
     return { eligible: false, reason: 'worker_not_found' };
   }
 
-  const daysLogged = worker.total_days_logged || 0;
+  // Count verified attendance logs, not the total_days_logged counter, which can drift from
+  // what was actually verified
+  const logs = await queryItems(
+    config.tables.attendance,
+    'worker_id = :wid',
+    { ':wid': workerId },
+  );
+  const daysLogged = new Set(logs.filter(isVerifiedLog).map((l) => l.log_date)).size;
   const threshold = config.certificateThreshold;
   const eligible = daysLogged >= threshold;
 
@@ -77,16 +89,45 @@ async function checkEligibility(workerId) {
 // Generate Certificate
 // ---------------------------------------------------------
 
-async function generateCertificate(workerId, event) {
+async function generateCertificate(workerId) {
   // Verify eligibility
   const eligibility = await checkEligibility(workerId);
   if (!eligibility.eligible) {
     return { success: false, ...eligibility };
   }
 
+  // Claim issuance with a conditional write on the worker, so of two concurrent calls only one
+  // issues a certificate; the other gets certificate_already_exists
+  const certificateId = uuidv4();
+  try {
+    await updateItem(
+      config.tables.workers,
+      { worker_id: workerId },
+      'SET certificate_claim = :cid',
+      { ':cid': certificateId },
+      undefined,
+      'attribute_not_exists(certificate_claim)',
+    );
+  } catch (err) {
+    if (err.name === 'ConditionalCheckFailedException') {
+      return { success: false, eligible: false, reason: 'certificate_already_exists' };
+    }
+    throw err;
+  }
+
+  try {
+    return await issueCertificate(workerId, certificateId);
+  } catch (err) {
+    // Release the claim so a later request can retry
+    await updateItem(config.tables.workers, { worker_id: workerId }, 'REMOVE certificate_claim', undefined)
+      .catch((e) => console.error('[Certificate] Failed to release claim:', e.message));
+    throw err;
+  }
+}
+
+async function issueCertificate(workerId, certificateId) {
   const worker = await getItem(config.tables.workers, { worker_id: workerId });
   const workerName = worker.name || 'Unknown Worker';
-  const language = event.language || worker.preferred_language || 'hi';
 
   // Fetch all attendance logs
   const attendanceLogs = await queryItems(
@@ -96,9 +137,7 @@ async function generateCertificate(workerId, event) {
   );
 
   // Filter to approved logs only
-  const approvedLogs = attendanceLogs.filter(
-    (log) => log.verification_status === 'auto_approved' || log.verification_status === 'approved',
-  );
+  const approvedLogs = attendanceLogs.filter(isVerifiedLog);
 
   // Collect unique sites
   const sitesMap = new Map();
@@ -117,11 +156,10 @@ async function generateCertificate(workerId, event) {
     .map((l) => l.log_date)
     .filter(Boolean)
     .sort();
-  const dateFrom = sortedDates[0] || new Date().toISOString().split('T')[0];
-  const dateTo = sortedDates[sortedDates.length - 1] || new Date().toISOString().split('T')[0];
+  const dateFrom = sortedDates[0] || istDate();
+  const dateTo = sortedDates[sortedDates.length - 1] || istDate();
 
-  // Generate certificate ID and SHA-256 hash
-  const certificateId = uuidv4();
+  // SHA-256 hash over the certificate data
   const certData = {
     certificateId,
     workerId,
@@ -142,8 +180,12 @@ async function generateCertificate(workerId, event) {
   // Generate BOCW reference number (mock for prototype)
   const bocwReference = `BOCW-${new Date().getFullYear()}-${Math.random().toString(36).substring(2, 8).toUpperCase()}`;
 
+  // Verification link encoded in the QR code: the officer page on the portal
+  const verificationUrl = getVerificationUrl(verificationHash);
+  const qrPng = await QRCode.toBuffer(verificationUrl, { type: 'png', margin: 1, width: 300 });
+
   // Build PDF content
-  const pdfBuffer = await buildCertificatePdf(certData, verificationHash, bocwReference);
+  const pdfBuffer = await buildCertificatePdf(certData, verificationHash, bocwReference, verificationUrl, qrPng);
 
   // Upload PDF to certificates S3 bucket
   const s3Key = `certificates/${workerId}/${certificateId}.pdf`;
@@ -155,14 +197,13 @@ async function generateCertificate(workerId, event) {
     { worker_id: workerId, certificate_id: certificateId },
   );
 
-  // Generate QR code data (verification URL)
-  const baseUrl = process.env.API_GATEWAY_URL || `https://ghkeex2vt7.execute-api.ap-south-1.amazonaws.com/${config.environment}`;
-  const verificationUrl = `${baseUrl}/api/certificate/${verificationHash}/verify`;
-
-  // Store in Certificates table
+  // Store in Certificates table, with a snapshot of the worker's identity as printed on the PDF
+  // (the verify endpoint shows these, even if the worker record changes later)
   const certificateRecord = {
     worker_id: workerId,
     certificate_id: certificateId,
+    worker_name: workerName,
+    aadhaar_last4: certData.aadhaarLast4,
     verification_hash: verificationHash,
     total_days: approvedLogs.length,
     date_from: dateFrom,
@@ -176,11 +217,11 @@ async function generateCertificate(workerId, event) {
 
   await putItem(config.tables.certificates, certificateRecord);
 
-  // Generate pre-signed URL for download
+  // Short-lived: WhatsApp delivery presigns its own link at send time from pdfS3Key
   const downloadUrl = await generatePresignedUrl(
     config.buckets.certificates,
     s3Key,
-    86400, // 24 hours
+    900,
   );
 
   return {
@@ -192,16 +233,29 @@ async function generateCertificate(workerId, event) {
     dateRange: { from: dateFrom, to: dateTo },
     sitesWorked,
     downloadUrl,
+    pdfS3Key: s3Key,
     verificationUrl,
     workerName,
   };
+}
+
+/**
+ * Portal page an officer opens to check the certificate. Without PORTAL_URL there is no public
+ * host to point at, so the QR carries just the hash, which can be pasted into the verify page.
+ */
+function getVerificationUrl(verificationHash) {
+  if (!config.portalUrl) {
+    console.warn('[Certificate] PORTAL_URL is not set; QR code will contain only the hash');
+    return verificationHash;
+  }
+  return `${config.portalUrl}/verify/${verificationHash}`;
 }
 
 // ---------------------------------------------------------
 // PDF Builder — Real PDF via pdfkit
 // ---------------------------------------------------------
 
-function buildCertificatePdf(certData, verificationHash, bocwReference) {
+function buildCertificatePdf(certData, verificationHash, bocwReference, verificationUrl, qrPng) {
   return new Promise((resolve, reject) => {
     const doc = new PDFDocument({
       size: 'A4',
@@ -317,24 +371,11 @@ function buildCertificatePdf(certData, verificationHash, bocwReference) {
     doc.fontSize(8).font('Courier').fillColor('#7f8c8d').text(verificationHash, leftCol, y);
     y += 20;
 
-    // --- QR Code placeholder ---
+    // --- QR Code ---
     const qrBoxSize = 90;
     const qrX = centerX - qrBoxSize / 2;
-    doc
-      .rect(qrX, y, qrBoxSize, qrBoxSize)
-      .lineWidth(1)
-      .strokeColor('#1a5276')
-      .stroke();
+    doc.image(qrPng, qrX, y, { width: qrBoxSize, height: qrBoxSize });
 
-    doc
-      .fontSize(8)
-      .font('Helvetica')
-      .fillColor('#7f8c8d')
-      .text('[QR CODE]', qrX, y + 30, { width: qrBoxSize, align: 'center' })
-      .text('Scan to verify', qrX, y + 44, { width: qrBoxSize, align: 'center' });
-
-    const baseUrl = process.env.API_GATEWAY_URL || `https://ghkeex2vt7.execute-api.ap-south-1.amazonaws.com/${config.environment}`;
-  const verificationUrl = `${baseUrl}/api/certificate/${verificationHash}/verify`;
     doc
       .fontSize(7)
       .font('Helvetica')

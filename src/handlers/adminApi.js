@@ -11,9 +11,10 @@ import {
   putItem,
   queryItems,
   updateItem,
+  deleteItem,
   scanTable,
+  scanPage,
   getPendingReviews,
-  getWorkerByPhone,
   getWorkerAttendanceLogs,
   incrementDaysLogged,
 } from '../utils/dynamodb.js';
@@ -26,10 +27,92 @@ import {
   getRefreshToken,
   deleteRefreshToken,
   getAdminByEmail,
+  normalizeEmail,
 } from '../middleware/auth.js';
 
+/** Client error with a safe, generic message */
+class HttpError extends Error {
+  constructor(statusCode, message) {
+    super(message);
+    this.statusCode = statusCode;
+  }
+}
+
+const badRequest = (message = 'Invalid request') => new HttpError(400, message);
+
+/** Admin-table item that marks the one-time bootstrap (seed) as used */
+const SEED_LOCK_ID = '__seed_lock__';
+
+/** Parse the JSON request body; malformed JSON or a non-object body is a 400 */
+function parseBody(event) {
+  let raw = event.body;
+  if (raw === null || raw === undefined || raw === '') return {};
+  if (typeof raw !== 'string') {
+    if (typeof raw === 'object' && !Array.isArray(raw)) return raw;
+    throw badRequest('Invalid request body');
+  }
+  if (event.isBase64Encoded) raw = Buffer.from(raw, 'base64').toString('utf8');
+  let body;
+  try {
+    body = JSON.parse(raw);
+  } catch {
+    throw badRequest('Invalid request body');
+  }
+  if (body === null) return {};
+  if (typeof body !== 'object' || Array.isArray(body)) throw badRequest('Invalid request body');
+  return body;
+}
+
+/** Throw a 400 unless value is undefined/null or a string */
+function optionalString(value) {
+  if (value !== undefined && value !== null && typeof value !== 'string') throw badRequest();
+  return value ?? undefined;
+}
+
+/** Parse ?limit — an integer in 1..max, or the default when absent */
+function parseLimit(params, defaultLimit, max = 100) {
+  const raw = params?.limit;
+  if (raw === undefined || raw === null || raw === '') return defaultLimit;
+  if (!/^\d+$/.test(String(raw))) throw badRequest('Invalid limit');
+  const n = parseInt(raw, 10);
+  if (n < 1 || n > max) throw badRequest('Invalid limit');
+  return n;
+}
+
+function encodeCursor(key) {
+  return key ? Buffer.from(JSON.stringify(key), 'utf8').toString('base64url') : null;
+}
+
+function decodeCursor(cursor) {
+  try {
+    const key = JSON.parse(Buffer.from(String(cursor), 'base64url').toString('utf8'));
+    if (!key || typeof key !== 'object' || Array.isArray(key)) throw new Error('bad cursor');
+    return key;
+  } catch {
+    throw badRequest('Invalid cursor');
+  }
+}
+
+/** Mask a phone number for admin views: ****1234 */
+function maskPhone(phone) {
+  return phone ? `****${String(phone).slice(-4)}` : '';
+}
+
+function safeDecode(value) {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
+function jwtConfigured() {
+  return !!(config.jwt.secret && config.jwt.refreshSecret);
+}
+
 export const handler = async (event) => {
-  const path = event.path || event.rawPath || '';
+  // REST API (v1) events carry `path`; HTTP API (v2) events carry `rawPath`. Trailing slashes are ignored.
+  const path = (event.path || event.rawPath || '').replace(/\/+$/, '') || '/';
   const method = event.httpMethod || event.requestContext?.http?.method;
 
   console.log(`AdminAPI: ${method} ${path}`);
@@ -58,8 +141,8 @@ export const handler = async (event) => {
     }
 
     // ── Public routes (no token required) ──────────────────
-    if (path.includes('/api/certificate/') && path.includes('/verify')) {
-      return await verifyCertificate(event);
+    if (path.includes('/api/certificate/') && path.endsWith('/verify')) {
+      return await verifyCertificate(event, path);
     }
 
     // ── Protected routes — require valid JWT ───────────────
@@ -80,8 +163,14 @@ export const handler = async (event) => {
       return await getDashboardStats();
     }
 
+    if (path.endsWith('/api/admin/sites')) {
+      if (method === 'GET') return await listSites();
+      if (method === 'POST') return await upsertSite(event);
+      return apiResponse(405, { error: 'Method not allowed' });
+    }
+
     if (path.includes('/api/admin/workers') && !path.includes('/api/admin/worker/')) {
-      return await listWorkers();
+      return await listWorkers(event);
     }
 
     if (path.includes('/api/admin/review-queue')) {
@@ -89,19 +178,15 @@ export const handler = async (event) => {
     }
 
     if (path.includes('/api/admin/review/') && method === 'PUT') {
-      return await handleReviewAction(event);
+      return await handleReviewAction(event, path);
     }
 
     if (path.includes('/api/admin/worker/')) {
-      return await getWorkerProfile(event);
+      return await getWorkerProfile(event, path);
     }
 
     if (path.includes('/api/worker/') && path.includes('/progress')) {
-      return await getWorkerProgress(event);
-    }
-
-    if (path.includes('/api/certificate/') && path.includes('/verify')) {
-      return await verifyCertificate(event);
+      return await getWorkerProgress(path);
     }
 
     if (path.includes('/api/admin/attendance-trends')) {
@@ -118,8 +203,12 @@ export const handler = async (event) => {
 
     return apiResponse(404, { error: 'Route not found' });
   } catch (err) {
+    if (err instanceof HttpError) {
+      return apiResponse(err.statusCode, { error: err.message });
+    }
+    // Never echo internal error details to the client
     console.error('AdminAPI error:', err);
-    return apiResponse(500, { error: 'Internal server error', message: err.message });
+    return apiResponse(500, { error: 'Internal server error' });
   }
 };
 
@@ -128,20 +217,24 @@ export const handler = async (event) => {
 // ─────────────────────────────────────────────────────────
 
 async function handleLogin(event) {
-  const body = typeof event.body === 'string' ? JSON.parse(event.body) : event.body;
-  const { email, password } = body || {};
+  const body = parseBody(event);
+  const email = optionalString(body.email);
+  const password = optionalString(body.password);
 
   if (!email || !password) {
     return apiResponse(400, { error: 'Email and password are required' });
   }
 
-  const admin = await getAdminByEmail(email);
-  if (!admin) {
-    return apiResponse(401, { error: 'Invalid email or password' });
+  if (!jwtConfigured()) {
+    console.error('AdminAPI: JWT_SECRET / JWT_REFRESH_SECRET not configured');
+    return apiResponse(500, { error: 'Server misconfigured' });
   }
 
-  const valid = await comparePassword(password, admin.password_hash);
-  if (!valid) {
+  const admin = await getAdminByEmail(email);
+  // Always run a bcrypt compare (dummy hash when the email is unknown) so timing does not
+  // reveal which emails have accounts
+  const valid = await comparePassword(password, admin?.password_hash);
+  if (!admin || !valid) {
     return apiResponse(401, { error: 'Invalid email or password' });
   }
 
@@ -164,11 +257,16 @@ async function handleLogin(event) {
 // ─────────────────────────────────────────────────────────
 
 async function handleRefresh(event) {
-  const body = typeof event.body === 'string' ? JSON.parse(event.body) : event.body;
-  const { refreshToken } = body || {};
+  const body = parseBody(event);
+  const refreshToken = optionalString(body.refreshToken);
 
   if (!refreshToken) {
     return apiResponse(400, { error: 'Refresh token is required' });
+  }
+
+  if (!jwtConfigured()) {
+    console.error('AdminAPI: JWT_SECRET / JWT_REFRESH_SECRET not configured');
+    return apiResponse(500, { error: 'Server misconfigured' });
   }
 
   const stored = await getRefreshToken(refreshToken);
@@ -203,8 +301,8 @@ async function handleRefresh(event) {
 // ─────────────────────────────────────────────────────────
 
 async function handleLogout(event) {
-  const body = typeof event.body === 'string' ? JSON.parse(event.body) : event.body;
-  const { refreshToken } = body || {};
+  const body = parseBody(event);
+  const refreshToken = optionalString(body.refreshToken);
 
   if (refreshToken) {
     await deleteRefreshToken(refreshToken);
@@ -214,45 +312,66 @@ async function handleLogout(event) {
 }
 
 // ─────────────────────────────────────────────────────────
-// POST /api/auth/seed — Create an admin (requires ADMIN_SEED_SECRET)
+// POST /api/auth/seed — One-time bootstrap of the first admin (requires ADMIN_SEED_SECRET)
 // ─────────────────────────────────────────────────────────
 
 async function handleSeed(event) {
   const seedSecret = process.env.ADMIN_SEED_SECRET || '';
 
   // Always require a configured, matching seed secret (every environment)
-  const body = typeof event.body === 'string' ? JSON.parse(event.body) : event.body;
-  const { email, password, name, seedSecret: providedSecret } = body || {};
-
+  const body = parseBody(event);
+  const providedSecret = optionalString(body.seedSecret);
   if (!seedSecret || providedSecret !== seedSecret) {
     return apiResponse(403, { error: 'Seed endpoint is disabled' });
   }
 
+  const email = normalizeEmail(optionalString(body.email));
+  const password = optionalString(body.password);
+  const name = optionalString(body.name)?.trim();
   if (!email || !password || !name) {
     return apiResponse(400, { error: 'Email, password, and name are required' });
   }
 
-  // Check if admin already exists
-  const existing = await getAdminByEmail(email);
-  if (existing) {
-    return apiResponse(409, { error: 'Admin with this email already exists' });
+  // Bootstrap only: once any admin (or the seed lock) exists, the endpoint is closed for good
+  const { items: existingAdmins } = await scanPage(config.tables.adminUsers, { Limit: 1 });
+  if (existingAdmins.length > 0) {
+    return apiResponse(403, { error: 'Seed endpoint is disabled' });
   }
 
-  const passwordHash = await hashPassword(password);
-  const adminId = randomUUID();
+  // Take the one-time seed lock; a concurrent seed loses the conditional write
+  const now = new Date().toISOString();
+  try {
+    await putItem(
+      config.tables.adminUsers,
+      { admin_id: SEED_LOCK_ID, kind: 'seed_lock', created_at: now },
+      'attribute_not_exists(admin_id)',
+    );
+  } catch (err) {
+    if (err.name === 'ConditionalCheckFailedException') {
+      return apiResponse(403, { error: 'Seed endpoint is disabled' });
+    }
+    throw err;
+  }
 
+  const adminId = randomUUID();
   const adminItem = {
     admin_id: adminId,
     email,
-    password_hash: passwordHash,
+    password_hash: await hashPassword(password),
     role: 'super_admin',
     name,
     permissions: {},
-    created_at: new Date().toISOString(),
-    updated_at: new Date().toISOString(),
+    created_at: now,
+    updated_at: now,
   };
 
-  await putItem(config.tables.adminUsers, adminItem);
+  try {
+    await putItem(config.tables.adminUsers, adminItem, 'attribute_not_exists(admin_id)');
+  } catch (err) {
+    // Release the lock so the bootstrap can be retried
+    await deleteItem(config.tables.adminUsers, { admin_id: SEED_LOCK_ID }).catch(() => {});
+    throw err;
+  }
 
   return apiResponse(201, {
     success: true,
@@ -265,16 +384,14 @@ async function handleSeed(event) {
 // ─────────────────────────────────────────────────────────
 
 async function getDashboardStats() {
-  // Get counts from each table
-  const [workers, pendingReviews, allLogs, allSites] = await Promise.all([
-    scanTable(config.tables.workers, { Select: 'COUNT' }),
-    getPendingReviews(100),
+  // Full (paginated) scans of each table
+  const [allWorkers, allLogs, allSites] = await Promise.all([
+    scanTable(config.tables.workers),
     scanTable(config.tables.attendance),
     scanTable(config.tables.sites),
   ]);
 
   // Aggregate worker stats
-  const allWorkers = await scanTable(config.tables.workers);
   const activeWorkers = allWorkers.filter((w) => w.profile_status === 'active');
   const onboardingWorkers = allWorkers.filter((w) => w.profile_status === 'onboarding');
   const totalDaysLogged = activeWorkers.reduce((sum, w) => sum + (w.total_days_logged || 0), 0);
@@ -326,11 +443,12 @@ async function getDashboardStats() {
     totalWorkers: allWorkers.length,
     activeWorkers: activeWorkers.length,
     onboardingWorkers: onboardingWorkers.length,
-    pendingReviews: pendingReviews.length,
+    pendingReviews: pendingCount,
     totalDaysLogged,
     averageDaysPerWorker: activeWorkers.length > 0
       ? Math.round(totalDaysLogged / activeWorkers.length)
       : 0,
+    certificateThreshold: config.certificateThreshold,
     trends,
     distribution,
     sites,
@@ -338,23 +456,39 @@ async function getDashboardStats() {
 }
 
 // ─────────────────────────────────────────────────────────
-// GET /api/admin/workers — List All Workers
+// GET /api/admin/workers — List Workers
+//   no ?limit/?cursor: every worker; with them: one page plus nextCursor
 // ─────────────────────────────────────────────────────────
 
-async function listWorkers() {
-  const allWorkers = await scanTable(config.tables.workers);
-  const workers = allWorkers.map((w) => ({
+function workerSummary(w) {
+  return {
     worker_id: w.worker_id,
     name: w.name,
-    phone_number: w.phone_number ? `****${w.phone_number.slice(-4)}` : '',
+    phone_number: maskPhone(w.phone_number),
     preferred_language: w.preferred_language,
     profile_status: w.profile_status,
     total_days_logged: w.total_days_logged || 0,
     aadhaar_verified: !!w.aadhaar_last4,
     selfie_verified: !!w.face_vector,
     bank_verified: !!w.bank_account_hash || !!w.registration_completed,
-  }));
-  return apiResponse(200, { workers });
+  };
+}
+
+async function listWorkers(event) {
+  const params = event.queryStringParameters || {};
+  const paged = (params.limit !== undefined && params.limit !== '') || !!params.cursor;
+
+  if (!paged) {
+    const allWorkers = await scanTable(config.tables.workers);
+    return apiResponse(200, { workers: allWorkers.map(workerSummary), nextCursor: null });
+  }
+
+  const limit = parseLimit(params, 50);
+  const { items, lastEvaluatedKey } = await scanPage(config.tables.workers, {
+    Limit: limit,
+    ...(params.cursor && { ExclusiveStartKey: decodeCursor(params.cursor) }),
+  });
+  return apiResponse(200, { workers: items.map(workerSummary), nextCursor: encodeCursor(lastEvaluatedKey) });
 }
 
 // ─────────────────────────────────────────────────────────
@@ -363,7 +497,7 @@ async function listWorkers() {
 
 async function getReviewQueue(event) {
   const params = event.queryStringParameters || {};
-  const limit = parseInt(params.limit || '20', 10);
+  const limit = parseLimit(params, 20);
 
   const items = await getPendingReviews(limit);
 
@@ -373,8 +507,9 @@ async function getReviewQueue(event) {
       const worker = await getItem(config.tables.workers, { worker_id: item.worker_id });
       return {
         ...item,
+        log_id: `${item.worker_id}#${item.log_date}`,
         worker_name: worker?.name || 'Unknown',
-        worker_phone: worker?.phone_number || '',
+        worker_phone: maskPhone(worker?.phone_number),
       };
     }),
   );
@@ -384,57 +519,103 @@ async function getReviewQueue(event) {
 
 // ─────────────────────────────────────────────────────────
 // PUT /api/admin/review/{logId} — Approve/Reject
+//   logId = `${worker_id}#${log_date}` (URL-encoded: %23). For backward compatibility the
+//   path may carry just the worker id, with body workerId (must equal it) and logDate.
 // ─────────────────────────────────────────────────────────
 
+const MAX_JUSTIFICATION_LENGTH = 1000;
+
 /**
- * Strip HTML and script tags from a string to prevent XSS / injection.
+ * Strip HTML and script tags (including an unterminated trailing tag) from a string.
  */
 function sanitizeString(str) {
   if (typeof str !== 'string') return '';
   return str
     .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
-    .replace(/<[^>]+>/g, '')
-    .trim();
+    .replace(/<[^>]*>/g, '')
+    .replace(/<[a-zA-Z!/?][\s\S]*$/, '')
+    .replace(/[<>]/g, '')
+    .trim()
+    .slice(0, MAX_JUSTIFICATION_LENGTH);
 }
 
-async function handleReviewAction(event) {
-  const pathParts = event.path.split('/');
-  const logId = pathParts[pathParts.length - 1];
-  const body = typeof event.body === 'string' ? JSON.parse(event.body) : event.body;
+/** Resolve { workerId, logDate } from the path id (authoritative) and the body */
+function resolveLogKey(event, path, body) {
+  const rawId = event.pathParameters?.logId ?? path.split('/').pop();
+  const logId = safeDecode(rawId || '');
+  const bodyWorkerId = optionalString(body.workerId);
+  const bodyLogDate = optionalString(body.logDate);
 
-  const { action, justification, workerId, logDate } = body || {};
+  const sep = logId.lastIndexOf('#');
+  if (sep > 0 && sep < logId.length - 1) {
+    const workerId = logId.slice(0, sep);
+    const logDate = logId.slice(sep + 1);
+    if ((bodyWorkerId !== undefined && bodyWorkerId !== workerId)
+      || (bodyLogDate !== undefined && bodyLogDate !== logDate)) {
+      throw badRequest('workerId/logDate do not match the log id in the path');
+    }
+    return { workerId, logDate };
+  }
+
+  // Legacy form: /api/admin/review/{workerId} with the date in the body
+  if (!logId || !bodyLogDate || bodyWorkerId !== logId) {
+    throw badRequest('Missing or mismatched workerId/logDate');
+  }
+  return { workerId: logId, logDate: bodyLogDate };
+}
+
+async function handleReviewAction(event, path) {
+  const body = parseBody(event);
+  const action = optionalString(body.action);
+  const justification = optionalString(body.justification);
 
   if (!action || !['approve', 'reject'].includes(action)) {
     return apiResponse(400, { error: 'Invalid action. Must be "approve" or "reject".' });
   }
 
-  if (!workerId || !logDate) {
-    return apiResponse(400, { error: 'Missing workerId or logDate' });
-  }
-
-  // Validate justification is required and non-empty for rejections
-  if (action === 'reject') {
-    if (!justification || typeof justification !== 'string' || justification.trim().length === 0) {
-      return apiResponse(400, { error: 'Justification is required when rejecting a review.' });
-    }
-  }
+  const { workerId, logDate } = resolveLogKey(event, path, body);
+  const logId = `${workerId}#${logDate}`;
 
   // Sanitize justification to strip HTML/script tags
   const sanitizedJustification = sanitizeString(justification || '');
 
+  // Justification is required (after sanitising) for rejections
+  if (action === 'reject' && sanitizedJustification.length === 0) {
+    return apiResponse(400, { error: 'Justification is required when rejecting a review.' });
+  }
+
   const newStatus = action === 'approve' ? 'approved' : 'rejected';
 
-  await updateItem(
-    config.tables.attendance,
-    { worker_id: workerId, log_date: logDate },
-    'SET verification_status = :status, admin_action = :action, admin_justification = :just, reviewed_at = :ts',
-    {
-      ':status': newStatus,
-      ':action': action,
-      ':just': sanitizedJustification,
-      ':ts': new Date().toISOString(),
-    },
-  );
+  // Only logs still waiting in the review queue can be decided, so a day is never counted twice
+  const log = await getItem(config.tables.attendance, { worker_id: workerId, log_date: logDate });
+  if (!log) {
+    return apiResponse(404, { error: 'Attendance log not found' });
+  }
+  if (log.verification_status !== 'pending_review') {
+    return apiResponse(409, { error: `Attendance log already ${log.verification_status}` });
+  }
+
+  try {
+    await updateItem(
+      config.tables.attendance,
+      { worker_id: workerId, log_date: logDate },
+      'SET verification_status = :status, admin_action = :action, admin_justification = :just, reviewed_at = :ts',
+      {
+        ':status': newStatus,
+        ':action': action,
+        ':just': sanitizedJustification,
+        ':ts': new Date().toISOString(),
+        ':pending': 'pending_review',
+      },
+      undefined,
+      'verification_status = :pending',
+    );
+  } catch (err) {
+    if (err.name === 'ConditionalCheckFailedException') {
+      return apiResponse(409, { error: 'Attendance log was already reviewed' });
+    }
+    throw err;
+  }
 
   // Increment days logged when admin approves (matches auto_approved behavior)
   if (action === 'approve') {
@@ -448,6 +629,7 @@ async function handleReviewAction(event) {
   return apiResponse(200, {
     success: true,
     logId,
+    log_id: logId,
     action,
     newStatus,
   });
@@ -457,9 +639,8 @@ async function handleReviewAction(event) {
 // GET /api/admin/worker/{id} — Worker Profile
 // ─────────────────────────────────────────────────────────
 
-async function getWorkerProfile(event) {
-  const pathParts = event.path.split('/');
-  const workerId = pathParts[pathParts.length - 1];
+async function getWorkerProfile(event, path) {
+  const workerId = safeDecode(event.pathParameters?.id ?? path.split('/').pop());
 
   const worker = await getItem(config.tables.workers, { worker_id: workerId });
   if (!worker) {
@@ -472,13 +653,16 @@ async function getWorkerProfile(event) {
     queryItems(config.tables.documents, 'worker_id = :wid', { ':wid': workerId }),
   ]);
 
-  // Mask sensitive data
+  // Explicit allow-list: no face vector / FaceId, no Aadhaar name or number, phone masked
   const safeWorker = {
-    ...worker,
-    aadhaar_encrypted: undefined, // never expose
-    phone_number: worker.phone_number
-      ? `****${worker.phone_number.slice(-4)}`
-      : '',
+    ...workerSummary(worker),
+    aadhaar_last4: worker.aadhaar_last4 || null,
+    registration_started: worker.registration_started || null,
+    registration_completed: worker.registration_completed || null,
+    admin_flag: worker.admin_flag || null,
+    admin_flag_reason: worker.admin_flag_reason || null,
+    created_at: worker.created_at || null,
+    updated_at: worker.updated_at || null,
   };
 
   return apiResponse(200, {
@@ -497,10 +681,10 @@ async function getWorkerProfile(event) {
 // GET /api/worker/{id}/progress — Worker Progress
 // ─────────────────────────────────────────────────────────
 
-async function getWorkerProgress(event) {
-  const pathParts = event.path.split('/');
+async function getWorkerProgress(path) {
+  const pathParts = path.split('/');
   // Path: /api/worker/{id}/progress — id is at index -2
-  const workerId = pathParts[pathParts.length - 2];
+  const workerId = safeDecode(pathParts[pathParts.length - 2]);
 
   const worker = await getItem(config.tables.workers, { worker_id: workerId });
   if (!worker) {
@@ -523,13 +707,15 @@ async function getWorkerProgress(event) {
 }
 
 // ─────────────────────────────────────────────────────────
-// GET /api/certificate/{id}/verify — Public QR Verification
+// GET /api/certificate/{hash}/verify — Public QR Verification
 // ─────────────────────────────────────────────────────────
 
-async function verifyCertificate(event) {
-  const pathParts = event.path.split('/');
-  // Path: /api/certificate/{id}/verify — id is at index -2
-  const certId = pathParts[pathParts.length - 2];
+async function verifyCertificate(event, path) {
+  const match = path.match(/\/api\/certificate\/([^/]+)\/verify$/);
+  const certId = safeDecode(event.pathParameters?.id ?? match?.[1] ?? '');
+  if (!certId) {
+    return apiResponse(404, { verified: false, message: 'Certificate not found or invalid hash' });
+  }
 
   // Search by verification hash via GSI
   const certs = await queryItems(
@@ -548,13 +734,19 @@ async function verifyCertificate(event) {
   }
 
   const cert = certs[0];
-  const worker = await getItem(config.tables.workers, { worker_id: cert.worker_id });
+  // Name as printed on the certificate; older certificates fall back to the live worker record
+  let workerName = cert.worker_name;
+  if (!workerName) {
+    const worker = await getItem(config.tables.workers, { worker_id: cert.worker_id });
+    workerName = worker?.name || 'Unknown';
+  }
 
-  // Return verification info WITHOUT PII
+  // Return verification info WITHOUT PII beyond name and Aadhaar last 4
   return apiResponse(200, {
     verified: true,
     certificate: {
-      worker_name: worker?.name || 'Unknown',
+      worker_name: workerName,
+      aadhaar_last4: cert.aadhaar_last4 || null,
       total_verified_days: cert.total_days,
       date_range: { from: cert.date_from, to: cert.date_to },
       sites_worked: cert.sites || [],
@@ -563,6 +755,83 @@ async function verifyCertificate(event) {
     },
     // Never expose: full Aadhaar, bank account, phone number
   });
+}
+
+// ─────────────────────────────────────────────────────────
+// /api/admin/sites — Geo-fenced work sites
+//   Stored in the shape attendanceProcessor's geo check reads:
+//   { site_id, site_name, geo_location: { latitude, longitude }, radius_meters,
+//     is_active: 'true' | 'false' (string — ActiveSitesIndex hash key) }
+// ─────────────────────────────────────────────────────────
+
+const SITE_ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
+
+function siteView(site) {
+  return {
+    site_id: site.site_id,
+    name: site.site_name || site.name || site.site_id,
+    latitude: site.geo_location?.latitude ?? null,
+    longitude: site.geo_location?.longitude ?? null,
+    radius_meters: site.radius_meters ?? null,
+    is_active: site.is_active === 'true' || site.is_active === true,
+    created_at: site.created_at || null,
+    updated_at: site.updated_at || null,
+  };
+}
+
+function numberInRange(value, min, max, field) {
+  const n = typeof value === 'string' && value.trim() !== '' ? Number(value) : value;
+  if (typeof n !== 'number' || !Number.isFinite(n) || n < min || n > max) {
+    throw badRequest(`${field} must be a number between ${min} and ${max}`);
+  }
+  return n;
+}
+
+async function listSites() {
+  const sites = await scanTable(config.tables.sites);
+  return apiResponse(200, {
+    sites: sites.map(siteView).sort((a, b) => String(a.name).localeCompare(String(b.name))),
+  });
+}
+
+async function upsertSite(event) {
+  const body = parseBody(event);
+
+  const siteIdInput = optionalString(body.site_id);
+  if (siteIdInput !== undefined && !SITE_ID_PATTERN.test(siteIdInput)) {
+    throw badRequest('site_id may contain only letters, digits, "-" and "_" (max 64)');
+  }
+  const name = sanitizeString(optionalString(body.name) || '').slice(0, 120);
+  if (!name) throw badRequest('name is required');
+  const latitude = numberInRange(body.latitude, -90, 90, 'latitude');
+  const longitude = numberInRange(body.longitude, -180, 180, 'longitude');
+  const radius = numberInRange(body.radius_meters, 50, 5000, 'radius_meters');
+
+  let isActive = true;
+  if (body.is_active !== undefined && body.is_active !== null) {
+    if (body.is_active === true || body.is_active === 'true') isActive = true;
+    else if (body.is_active === false || body.is_active === 'false') isActive = false;
+    else throw badRequest('is_active must be a boolean');
+  }
+
+  const siteId = siteIdInput || `SITE-${randomUUID()}`;
+  const existing = siteIdInput ? await getItem(config.tables.sites, { site_id: siteId }) : null;
+  const now = new Date().toISOString();
+
+  const site = {
+    ...(existing || {}),
+    site_id: siteId,
+    site_name: name,
+    geo_location: { latitude, longitude },
+    radius_meters: Math.round(radius),
+    is_active: isActive ? 'true' : 'false',
+    created_at: existing?.created_at || now,
+    updated_at: now,
+  };
+  delete site.name;
+
+  await putItem(config.tables.sites, site);
+  return apiResponse(existing ? 200 : 201, { site: siteView(site), created: !existing });
 }
 
 // ─────────────────────────────────────────────────────────

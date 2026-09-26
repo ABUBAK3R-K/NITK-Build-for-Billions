@@ -1,20 +1,31 @@
-import React, { useState, useEffect } from 'react';
-import { NavLink, Outlet, useNavigate } from 'react-router-dom';
+import React, { useState, useEffect, useCallback } from 'react';
+import { NavLink, Outlet, useNavigate, useLocation } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
 import api from '../utils/api';
+import { REVIEW_QUEUE_CHANGED } from '../utils/events';
 
 export default function Layout() {
     const [reviewCount, setReviewCount] = useState(0);
     const [isSidebarOpen, setIsSidebarOpen] = useState(false);
     const { admin, logout } = useAuth();
     const navigate = useNavigate();
+    const location = useLocation();
 
-    useEffect(() => {
-        api.get('/api/admin/review-queue')
-            .then(res => res.json())
-            .then(data => setReviewCount(data.count || 0))
+    const refreshReviewCount = useCallback(() => {
+        api.get('/api/admin/review-queue?limit=50')
+            .then(res => (res.ok ? res.json() : null))
+            .then(data => { if (data) setReviewCount(data.count ?? (data.items || []).length); })
             .catch(() => {});
     }, []);
+
+    // Refresh the badge on every route change...
+    useEffect(() => { refreshReviewCount(); }, [location.pathname, refreshReviewCount]);
+
+    // ...and whenever a review action changes the queue
+    useEffect(() => {
+        window.addEventListener(REVIEW_QUEUE_CHANGED, refreshReviewCount);
+        return () => window.removeEventListener(REVIEW_QUEUE_CHANGED, refreshReviewCount);
+    }, [refreshReviewCount]);
 
     const toggleSidebar = () => setIsSidebarOpen(!isSidebarOpen);
 
@@ -66,7 +77,7 @@ export default function Layout() {
                         onClick={() => setIsSidebarOpen(false)}
                     >
                         <span className="icon">&#x1F4CB;</span> Review Queue
-                        <span className="nav-badge">{reviewCount}</span>
+                        <span className="nav-badge">{reviewCount >= 50 ? '50+' : reviewCount}</span>
                     </NavLink>
                     <NavLink
                         to="/workers"
@@ -74,6 +85,13 @@ export default function Layout() {
                         onClick={() => setIsSidebarOpen(false)}
                     >
                         <span className="icon">&#x1F477;</span> Workers
+                    </NavLink>
+                    <NavLink
+                        to="/sites"
+                        className={({ isActive }) => `nav-link ${isActive ? 'active' : ''}`}
+                        onClick={() => setIsSidebarOpen(false)}
+                    >
+                        <span className="icon">&#x1F4CD;</span> Sites
                     </NavLink>
                     <NavLink
                         to="/verify"

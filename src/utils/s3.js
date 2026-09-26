@@ -3,7 +3,7 @@
  * Upload/download helpers with SSE-S3 (AES256) encryption + pre-signed URL generation.
  */
 
-import { S3Client, PutObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
+import { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import config, { isDemoMode } from './config.js';
 
@@ -74,6 +74,20 @@ export async function downloadFromS3(bucket, key) {
 }
 
 /**
+ * Delete a file from S3 (e.g. an identity document image once OCR is done)
+ * @param {string} bucket
+ * @param {string} key
+ */
+export async function deleteFromS3(bucket, key) {
+  if (IS_DEMO) {
+    memS3.delete(`${bucket}/${key}`);
+    console.log(`[MockS3] DELETE ${bucket}/${key}`);
+    return;
+  }
+  await s3Client.send(new DeleteObjectCommand({ Bucket: bucket, Key: key }));
+}
+
+/**
  * Generate a pre-signed URL for downloading an S3 object
  * @param {string} bucket
  * @param {string} key
@@ -109,6 +123,15 @@ export async function uploadWorkerMedia(workerId, mediaType, buffer, contentType
 }
 
 /**
+ * S3 key (media-raw bucket) of a worker's enrolled reference selfie, used for 1:1 face matching
+ * at every check-in. The enrolled/ prefix is kept out of the 90-day raw-media expiry rule.
+ * @param {string} workerId
+ */
+export function enrolledSelfieKey(workerId) {
+  return `enrolled/${workerId}/selfie.jpg`;
+}
+
+/**
  * Upload processed audio (Polly TTS output) to processed bucket
  * @param {string} workerId
  * @param {string} label - e.g. 'greeting', 'confirmation'
@@ -127,7 +150,9 @@ export async function uploadProcessedAudio(workerId, label, audioBuffer) {
 export default {
   uploadToS3,
   downloadFromS3,
+  deleteFromS3,
   generatePresignedUrl,
   uploadWorkerMedia,
   uploadProcessedAudio,
+  enrolledSelfieKey,
 };

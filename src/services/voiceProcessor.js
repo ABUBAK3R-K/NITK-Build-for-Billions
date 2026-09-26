@@ -10,11 +10,12 @@ import {
   StartTranscriptionJobCommand,
   GetTranscriptionJobCommand,
 } from '@aws-sdk/client-transcribe';
-import config from '../utils/config.js';
+import config, { isDemoMode } from '../utils/config.js';
 import { complete } from '../providers/llm.js';
-import { uploadProcessedAudio, uploadWorkerMedia } from '../utils/s3.js';
+import { uploadProcessedAudio, uploadWorkerMedia, downloadFromS3 } from '../utils/s3.js';
 import { generatePresignedUrl } from '../utils/s3.js';
 import { withRetry } from '../utils/retryHelper.js';
+import { KN } from '../utils/i18n.js';
 
 const pollyClient = new PollyClient({ region: config.aws.region });
 const transcribeClient = new TranscribeClient({ region: config.aws.region });
@@ -32,30 +33,77 @@ export async function detectLanguage(text) {
   // Simple keyword-based detection — no LLM call needed, faster and cheaper
   const lower = (text || '').toLowerCase();
 
-  const patterns = {
-    en: /\b(hello|hi|good morning|please|thank|work|site|name|my|the|is|am)\b/,
-    ta: /[\u0B80-\u0BFF]|vanakkam|nandri/,
-    te: /[\u0C00-\u0C7F]|namaskaram/,
-    kn: /[\u0C80-\u0CFF]|namaskara/,
-    ml: /[\u0D00-\u0D7F]|namaskkaram/,
-    bn: /[\u0980-\u09FF]|namaskar/,
-    mr: /[\u0900-\u097F].*\b(mi|mala|aahe)\b/,
-    gu: /[\u0A80-\u0AFF]|kem cho/,
-  };
+  // A message naming a language ("English", "ಕನ್ನಡ") is an explicit choice
+  const named = parseLanguageSwitch(text);
+  if (named) return named;
 
-  // Check for Devanagari script (Hindi/Marathi) first
-  if (/[\u0900-\u097F]/.test(text)) {
+  // Native scripts are unambiguous, so they are checked before any romanized keyword
+  const scripts = {
+    ta: /[\u0B80-\u0BFF]/,
+    te: /[\u0C00-\u0C7F]/,
+    kn: /[\u0C80-\u0CFF]/,
+    ml: /[\u0D00-\u0D7F]/,
+    bn: /[\u0980-\u09FF]/,
+    gu: /[\u0A80-\u0AFF]/,
+  };
+  for (const [lang, pattern] of Object.entries(scripts)) {
+    if (pattern.test(text || '')) return lang;
+  }
+
+  // Devanagari script (Hindi/Marathi)
+  if (/[\u0900-\u097F]/.test(text || '')) {
     // Marathi-specific words
-    if (/\b(mi|mala|aahe|kay)\b/.test(lower)) return 'mr';
+    if (/(^|\s)(मी|मला|आहे|काय)(\s|$)/.test(text)) return 'mr';
     return 'hi';
   }
 
-  for (const [lang, pattern] of Object.entries(patterns)) {
-    if (pattern.test(lower) || pattern.test(text)) return lang;
+  // Romanized greetings. "namaskar" / "namaste" are Hindi (the default), not Bengali.
+  const keywords = {
+    ta: /\b(vanakkam|nandri)\b/,
+    te: /\bnamaskaram\b/,
+    kn: /\bnamaskara\b/,
+    ml: /\bnamaskkaram\b/,
+    gu: /\bkem cho\b/,
+    en: /\b(hello|hi|good morning|please|thank|work|site|name|my|the|is|am)\b/,
+  };
+  for (const [lang, pattern] of Object.entries(keywords)) {
+    if (pattern.test(lower)) return lang;
   }
 
   // Default to Hindi for Indian construction workers
   return 'hi';
+}
+
+// Language names a worker can send to switch language, in English and in their own script
+const LANGUAGE_NAMES = {
+  en: ['english', 'angrezi', 'angreji', 'अंग्रेज़ी', 'अंग्रेजी'],
+  hi: ['hindi', 'हिंदी', 'हिन्दी'],
+  kn: ['kannada', 'ಕನ್ನಡ'],
+  ta: ['tamil', 'தமிழ்'],
+  te: ['telugu', 'తెలుగు'],
+  ml: ['malayalam', 'മലയാളം'],
+  bn: ['bengali', 'bangla', 'বাংলা'],
+  mr: ['marathi', 'मराठी'],
+  gu: ['gujarati', 'ગુજરાતી'],
+};
+
+/**
+ * Detect an explicit language-switch message such as "English", "Hindi please", "ಕನ್ನಡ" or
+ * "language: Kannada". Only a message that is essentially just a language name counts.
+ * @param {string} text
+ * @returns {string|null} ISO 639-1 code, or null if the message is not a language choice
+ */
+export function parseLanguageSwitch(text) {
+  const words = String(text || '')
+    .toLowerCase()
+    .replace(/[^\p{L}\p{M}\s]/gu, ' ')
+    .split(/\s+/)
+    .filter((w) => w && !['in', 'language', 'bhasha', 'please', 'plz', 'mein', 'me', 'change', 'to', 'switch', 'बात', 'में', 'भाषा'].includes(w));
+  if (words.length !== 1) return null;
+  for (const [lang, names] of Object.entries(LANGUAGE_NAMES)) {
+    if (names.includes(words[0])) return lang;
+  }
+  return null;
 }
 
 // ─────────────────────────────────────────────────────────
@@ -81,17 +129,17 @@ const TRANSCRIBE_LANGUAGE_MAP = {
  * @param {Buffer} audioBuffer - Audio file buffer (ogg/wav/mp3)
  * @param {string} language - ISO 639-1 code
  * @param {string} [workerId] - Worker ID for S3 path
- * @returns {Promise<string>} Transcribed text
+ * @returns {Promise<string>} Transcribed text, or '' if nothing could be transcribed
  */
 export async function transcribeVoice(audioBuffer, language = 'hi', workerId = 'temp') {
   // Demo mode: return mock transcription
-  if (config.environment === 'dev' && (!audioBuffer || audioBuffer.length < 100)) {
+  if (isDemoMode() && (!audioBuffer || audioBuffer.length < 100)) {
     console.log('[VoiceProcessor DEMO] Returning mock transcription');
     return 'Ram Kumar';
   }
 
   if (!audioBuffer || audioBuffer.length < 100) {
-    return 'Unknown';
+    return '';
   }
 
   try {
@@ -102,6 +150,7 @@ export async function transcribeVoice(audioBuffer, language = 'hi', workerId = '
 
     // Step 2: Start Transcribe job
     const jobName = `nirman-${workerId}-${Date.now()}`;
+    const outputKey = `transcriptions/${jobName}.json`;
     const languageCode = TRANSCRIBE_LANGUAGE_MAP[language] || 'hi-IN';
 
     await withRetry(
@@ -112,7 +161,7 @@ export async function transcribeVoice(audioBuffer, language = 'hi', workerId = '
           MediaFormat: 'ogg',
           Media: { MediaFileUri: s3Uri },
           OutputBucketName: config.buckets.mediaProcessed,
-          OutputKey: `transcriptions/${jobName}.json`,
+          OutputKey: outputKey,
         }),
       ),
       { label: 'Transcribe:StartJob' },
@@ -130,13 +179,11 @@ export async function transcribeVoice(audioBuffer, language = 'hi', workerId = '
       const jobStatus = status.TranscriptionJob?.TranscriptionJobStatus;
 
       if (jobStatus === 'COMPLETED') {
-        // Fetch transcript from the result
-        const transcriptUri = status.TranscriptionJob?.Transcript?.TranscriptFileUri;
-        if (transcriptUri) {
-          const response = await fetch(transcriptUri);
-          const data = await response.json();
-          transcript = data.results?.transcripts?.[0]?.transcript || '';
-        }
+        // The output bucket is private, so read the result with the S3 SDK (a plain fetch of
+        // TranscriptFileUri returns 403)
+        const body = await downloadFromS3(config.buckets.mediaProcessed, outputKey);
+        const data = JSON.parse(body.toString('utf-8'));
+        transcript = data.results?.transcripts?.[0]?.transcript || '';
         break;
       }
 
@@ -148,26 +195,13 @@ export async function transcribeVoice(audioBuffer, language = 'hi', workerId = '
 
     if (transcript) {
       console.log(`[Transcribe] Result: "${transcript.substring(0, 100)}"`);
-      return transcript;
+    } else {
+      console.warn('[Transcribe] No transcript produced');
     }
-
-    // Fallback to the LLM if Transcribe didn't produce a result
-    console.warn('[Transcribe] No result, falling back to LLM text analysis');
-    return await transcribeFallback(language);
+    return transcript;
   } catch (err) {
-    console.error('Transcribe failed, using fallback:', err.message);
-    return await transcribeFallback(language);
-  }
-}
-
-/** Fallback transcription using the LLM when Transcribe fails */
-async function transcribeFallback(language) {
-  try {
-    const prompt = `An Indian construction worker sent a voice note in ${language === 'hi' ? 'Hindi' : 'English'}. They are likely stating their name or describing their daily work at a construction site. Generate a realistic short transcription (1-2 sentences). Return ONLY the transcription text.`;
-    const response = await complete({ prompt, maxTokens: 100 });
-    return response.trim() || 'Unknown';
-  } catch {
-    return 'Unknown';
+    console.error('Transcribe failed:', err.message);
+    return '';
   }
 }
 
@@ -179,10 +213,13 @@ async function transcribeFallback(language) {
  * Generate a voice response using Amazon Polly Neural TTS
  * @param {string} text - Text to speak
  * @param {string} languageCode - ISO 639-1 code (hi, en, etc.)
- * @returns {Promise<Buffer>} Audio buffer (MP3)
+ * @returns {Promise<Buffer>} Audio buffer (MP3); empty when the language has no Polly voice
  */
 export async function generateVoiceResponse(text, languageCode = 'hi') {
-  const voiceConfig = config.pollyVoices[languageCode] || config.pollyVoices.hi;
+  const voiceConfig = config.pollyVoices[languageCode];
+  // No Polly voice for this language: speaking it with another language's voice would be
+  // unintelligible, so the reply goes out as text only
+  if (!voiceConfig) return Buffer.alloc(0);
 
   try {
     const result = await withRetry(
@@ -211,15 +248,22 @@ export async function generateVoiceResponse(text, languageCode = 'hi') {
   }
 }
 
+/** Whether Amazon Polly has a voice for this language (see config.pollyVoices) */
+export function hasPollyVoice(languageCode) {
+  return Boolean(config.pollyVoices[languageCode]);
+}
+
 /**
  * Generate voice response, upload to S3, and return a pre-signed URL
  * @param {string} workerId
  * @param {string} text - Text to speak
  * @param {string} languageCode
  * @param {string} label - e.g. 'greeting', 'confirmation'
- * @returns {Promise<string>} Pre-signed URL to the audio file
+ * @returns {Promise<string|null>} Pre-signed URL to the audio file, or null when there is no
+ *   voice for the language or Polly failed
  */
 export async function generateAndUploadVoice(workerId, text, languageCode, label) {
+  if (!hasPollyVoice(languageCode)) return null; // text-only reply (e.g. Kannada)
   const audioBuffer = await generateVoiceResponse(text, languageCode);
 
   if (audioBuffer.length === 0) {
@@ -261,6 +305,7 @@ export function getGreetingMessage(language, workerName) {
     en: workerName
       ? `Hello ${workerName}! I am Nirman Mitra. Your registration is complete. You can now log attendance daily by sending a selfie and voice note.`
       : `Hello! I am Nirman Mitra — your digital companion. To start registration, please say your name.`,
+    kn: workerName ? KN.greetingRegistered(workerName) : KN.greetingNew,
   };
   return greetings[language] || greetings.hi;
 }
@@ -271,30 +316,37 @@ export function getStepPrompt(step, language = 'hi') {
     awaiting_name: {
       hi: 'Kripya apna poora naam boliye ya type kariye.',
       en: 'Please say or type your full name.',
+      kn: KN.stepName,
     },
     awaiting_aadhaar: {
       hi: 'Dhanyavaad! Ab kripya apne Aadhaar card ka photo bhejiye.',
       en: 'Thank you! Now please send a photo of your Aadhaar card.',
+      kn: KN.stepAadhaar,
     },
     awaiting_selfie: {
       hi: 'Aadhaar verified! Ab kripya apna ek selfie photo bhejiye.',
       en: 'Aadhaar verified! Now please send a selfie photo.',
+      kn: KN.stepSelfie,
     },
     awaiting_passbook: {
       hi: 'Selfie saved! Ab kripya apne bank passbook ka photo bhejiye.',
       en: 'Selfie saved! Now please send a photo of your bank passbook.',
+      kn: KN.stepPassbook,
     },
     registration_complete: {
       hi: 'Badhai ho! Aapka registration poora ho gaya. Ab aap har din selfie aur voice note bhejkar attendance log kar sakte hain.',
       en: 'Congratulations! Your registration is complete. You can now log attendance daily by sending a selfie and voice note.',
+      kn: KN.stepRegistrationComplete,
     },
     retry_image: {
       hi: 'Photo clear nahi hai. Kripya achchi roshni mein dobara photo bhejiye.',
       en: 'The photo is not clear. Please send another photo in good lighting.',
+      kn: KN.stepRetryImage,
     },
     error: {
       hi: 'Kuch problem ho gayi. Kripya thodi der baad dobara koshish karein.',
       en: 'Something went wrong. Please try again after some time.',
+      kn: KN.stepError,
     },
   };
   return prompts[step]?.[language] || prompts[step]?.hi || prompts.error.hi;
@@ -302,9 +354,11 @@ export function getStepPrompt(step, language = 'hi') {
 
 export default {
   detectLanguage,
+  parseLanguageSwitch,
   transcribeVoice,
   generateVoiceResponse,
   generateAndUploadVoice,
+  hasPollyVoice,
   invokeLLM,
   getGreetingMessage,
   getStepPrompt,

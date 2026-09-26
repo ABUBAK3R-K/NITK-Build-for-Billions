@@ -11,6 +11,15 @@ import { putItem, getItem, deleteItem, queryItems } from '../utils/dynamodb.js';
 
 const SALT_ROUNDS = 12;
 
+// bcrypt hash (same cost factor) of a random throwaway password. Compared against when the
+// email is unknown, so a login for a missing account takes as long as one with a wrong password.
+const DUMMY_PASSWORD_HASH = '$2b$12$7t9gWIE9Ce3qT/covSBtKOXZW2hc4YVJI84U/k0jax5Nol/1wx1qG';
+
+/** Canonical form of an admin email: trimmed and lower-cased. */
+export function normalizeEmail(email) {
+  return typeof email === 'string' ? email.trim().toLowerCase() : '';
+}
+
 /**
  * Extract and verify the access token from the Authorization header.
  * Returns decoded payload { admin_id, email, role } or null.
@@ -78,8 +87,15 @@ export async function hashPassword(password) {
 
 /**
  * Compare a plaintext password against a bcrypt hash.
+ * With no hash (unknown account) it still runs a full compare against a dummy hash and
+ * returns false, keeping the response time independent of whether the account exists.
  */
 export async function comparePassword(password, hash) {
+  if (typeof password !== 'string') return false;
+  if (!hash) {
+    await bcrypt.compare(password, DUMMY_PASSWORD_HASH);
+    return false;
+  }
   return bcrypt.compare(password, hash);
 }
 
@@ -101,14 +117,23 @@ export async function deleteRefreshToken(rawToken) {
 
 /**
  * Look up an admin by email using the EmailIndex GSI.
+ * The email is normalised first; admins stored before normalisation was introduced are
+ * still found by their exact stored spelling.
  */
 export async function getAdminByEmail(email) {
-  const items = await queryItems(
-    config.tables.adminUsers,
-    'email = :email',
-    { ':email': email },
-    'EmailIndex',
-    { Limit: 1 },
-  );
-  return items.length > 0 ? items[0] : null;
+  const normalized = normalizeEmail(email);
+  if (!normalized) return null;
+  const lookup = async (value) => {
+    const items = await queryItems(
+      config.tables.adminUsers,
+      'email = :email',
+      { ':email': value },
+      'EmailIndex',
+      { Limit: 1 },
+    );
+    return items.length > 0 ? items[0] : null;
+  };
+  const admin = await lookup(normalized);
+  if (admin || normalized === email) return admin;
+  return lookup(email);
 }

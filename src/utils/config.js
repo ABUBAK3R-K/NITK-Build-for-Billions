@@ -4,15 +4,39 @@
  * Provides demo mode toggle and utility helpers.
  */
 
+/** CERTIFICATE_THRESHOLD must be an integer >= 1; anything else would issue certificates too early */
+function parseCertificateThreshold(raw = '3') {
+  const value = String(raw).trim();
+  if (/^\d+$/.test(value) && parseInt(value, 10) >= 1) return parseInt(value, 10);
+  console.error(`[Config] Invalid CERTIFICATE_THRESHOLD "${raw}"; falling back to 90`);
+  return 90;
+}
+
 const config = Object.freeze({
   // Environment
   environment: process.env.ENVIRONMENT || 'dev',
-  certificateThreshold: parseInt(process.env.CERTIFICATE_THRESHOLD || '3', 10),
+  certificateThreshold: parseCertificateThreshold(process.env.CERTIFICATE_THRESHOLD),
+
+  // Process webhook messages in a separate async invocation (set in template.yaml; only on Lambda)
+  asyncWebhook: process.env.ASYNC_WEBHOOK === 'true' && Boolean(process.env.AWS_LAMBDA_FUNCTION_NAME),
+
+  // Public URL of the dashboard / officer portal (no trailing slash); certificate QR codes link here
+  portalUrl: (process.env.PORTAL_URL || '').replace(/\/+$/, ''),
+
+  // Team phone numbers (digits only, comma-separated) allowed to use the "demo cert" /
+  // "test review" keywords. Empty means nobody can.
+  demoPhoneNumbers: (process.env.DEMO_PHONE_NUMBERS || '')
+    .split(',')
+    .map((n) => n.replace(/\D/g, ''))
+    .filter(Boolean),
 
   // JWT Auth
   jwt: {
-    secret: process.env.JWT_SECRET || 'dev-jwt-secret-change-me',
-    refreshSecret: process.env.JWT_REFRESH_SECRET || 'dev-refresh-secret-change-me',
+    // The dev fallbacks apply only to local runs. On Lambda a missing secret stays empty, so
+    // signing fails and every token is rejected instead of trusting a publicly known key.
+    secret: process.env.JWT_SECRET || (process.env.AWS_LAMBDA_FUNCTION_NAME ? '' : 'dev-jwt-secret-change-me'),
+    refreshSecret: process.env.JWT_REFRESH_SECRET
+      || (process.env.AWS_LAMBDA_FUNCTION_NAME ? '' : 'dev-refresh-secret-change-me'),
     accessTokenExpiry: '15m',
     refreshTokenExpiry: '7d',
   },
@@ -81,23 +105,28 @@ const config = Object.freeze({
     groqApiKey: process.env.GROQ_API_KEY || '',
   },
 
-  // Polly language → voice mapping (Neural voices for Indian languages)
+  // Polly language → voice mapping. Polly's only Indian voices are hi-IN and en-IN (Kajal,
+  // Aditi, Raveena); there is no Kannada, Tamil, Telugu, Malayalam, Bengali, Marathi or Gujarati
+  // voice (https://docs.aws.amazon.com/polly/latest/dg/available-voices.html). Languages not
+  // listed here get text-only replies rather than being read out by a Hindi voice.
   pollyVoices: {
     hi: { voiceId: 'Kajal', engine: 'neural', languageCode: 'hi-IN' },
     en: { voiceId: 'Kajal', engine: 'neural', languageCode: 'en-IN' },
-    ta: { voiceId: 'Kajal', engine: 'neural', languageCode: 'hi-IN' }, // fallback
-    te: { voiceId: 'Kajal', engine: 'neural', languageCode: 'hi-IN' }, // fallback
-    kn: { voiceId: 'Kajal', engine: 'neural', languageCode: 'hi-IN' }, // fallback
-    bn: { voiceId: 'Kajal', engine: 'neural', languageCode: 'hi-IN' }, // fallback
-    mr: { voiceId: 'Kajal', engine: 'neural', languageCode: 'hi-IN' }, // fallback
-    gu: { voiceId: 'Kajal', engine: 'neural', languageCode: 'hi-IN' }, // fallback
-    ml: { voiceId: 'Kajal', engine: 'neural', languageCode: 'hi-IN' }, // fallback
   },
 });
 
 /** Check if running in demo/dev mode (only true when running locally, not on Lambda) */
 export function isDemoMode() {
   return !process.env.AWS_LAMBDA_FUNCTION_NAME && config.environment === 'dev';
+}
+
+/**
+ * Calendar date (YYYY-MM-DD) in IST (UTC+5:30). Attendance "days" are Indian calendar days,
+ * so a check-in at 01:00 IST belongs to that IST date, not the previous UTC date.
+ * @param {number} [ms] - Epoch milliseconds (default now)
+ */
+export function istDate(ms = Date.now()) {
+  return new Date(ms + 5.5 * 60 * 60 * 1000).toISOString().split('T')[0];
 }
 
 /** Get certificate threshold (3 for demo, 90 for prod) */

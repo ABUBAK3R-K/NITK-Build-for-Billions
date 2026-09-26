@@ -36,8 +36,30 @@ function tableStore(tableName) {
   return memStore.get(tableName);
 }
 
+/**
+ * Evaluate the simple condition expressions this codebase uses against an in-memory item:
+ * attribute_exists(a), attribute_not_exists(a), a = :v and a <> :v, joined by AND or OR.
+ */
+function mockConditionHolds(item, expression, values = {}, names = {}) {
+  const attr = (token) => item?.[names[token] ?? token];
+  const clause = (text) => {
+    const c = text.trim();
+    let m;
+    if ((m = c.match(/^attribute_not_exists\(\s*(\S+?)\s*\)$/i))) return attr(m[1]) === undefined;
+    if ((m = c.match(/^attribute_exists\(\s*(\S+?)\s*\)$/i))) return attr(m[1]) !== undefined;
+    if ((m = c.match(/^(\S+)\s*<>\s*(:\w+)$/))) return attr(m[1]) !== values[m[2]];
+    if ((m = c.match(/^(\S+)\s*=\s*(:\w+)$/))) return attr(m[1]) === values[m[2]];
+    throw new Error(`[MockDB] Unsupported condition: ${c}`);
+  };
+  return expression.split(/\s+OR\s+/i).some((any) => any.split(/\s+AND\s+/i).every(clause));
+}
+
+function conditionalCheckFailed() {
+  return Object.assign(new Error('The conditional request failed'), { name: 'ConditionalCheckFailedException' });
+}
+
 const mockDb = {
-  async putItem(tableName, item) {
+  async putItem(tableName, item, conditionExpression, expressionValues, expressionNames) {
     // Derive primary key from item (first one or two defined key fields)
     const store = tableStore(tableName);
     const key = memKey(item.worker_id !== undefined
@@ -57,6 +79,9 @@ const mockDb = {
           : item.site_id !== undefined
             ? { site_id: item.site_id }
             : { _id: JSON.stringify(item) });
+    if (conditionExpression && !mockConditionHolds(store.get(key), conditionExpression, expressionValues, expressionNames)) {
+      throw conditionalCheckFailed();
+    }
     store.set(key, { ...item });
     console.log(`[MockDB] PUT ${tableName}[${key}]`);
     return item;
@@ -74,7 +99,7 @@ const mockDb = {
     const all = Array.from(store.values());
     // Simple linear scan: match items where the expression values appear in the item
     const results = all.filter(item =>
-      Object.entries(expressionValues).every(([placeholder, val]) => {
+      Object.entries(expressionValues).every(([_placeholder, val]) => {
         return Object.values(item).some(v => v === val);
       })
     );
@@ -84,9 +109,12 @@ const mockDb = {
     return sliced;
   },
 
-  async updateItem(tableName, key, updateExpression, expressionValues, expressionNames) {
+  async updateItem(tableName, key, updateExpression, expressionValues, expressionNames, conditionExpression) {
     const k = memKey(key);
     const store = tableStore(tableName);
+    if (conditionExpression && !mockConditionHolds(store.get(k), conditionExpression, expressionValues, expressionNames)) {
+      throw conditionalCheckFailed();
+    }
     const existing = store.get(k) || { ...key };
     // Parse simple SET expressions like: SET field = :val, field2 = :val2
     const updated = { ...existing };
@@ -115,7 +143,7 @@ const mockDb = {
     console.log(`[MockDB] DELETE ${tableName}[${k}]`);
   },
 
-  async scanTable(tableName, options = {}) {
+  async scanTable(tableName) {
     const items = Array.from(tableStore(tableName).values());
     console.log(`[MockDB] SCAN ${tableName} → ${items.length} item(s)`);
     return items;
@@ -139,10 +167,20 @@ const docClient = IS_DEMO ? null : DynamoDBDocumentClient.from(client, {
  * Put an item into a DynamoDB table
  * @param {string} tableName
  * @param {object} item
+ * @param {string} [conditionExpression] - e.g. 'attribute_not_exists(admin_id)'; a failed
+ *   condition throws ConditionalCheckFailedException
+ * @param {object} [expressionValues] - Values referenced by the condition, e.g. { ':v': 'x' }
+ * @param {object} [expressionNames] - Names referenced by the condition, e.g. { '#a': 'status' }
  */
-export async function putItem(tableName, item) {
-  if (IS_DEMO) return mockDb.putItem(tableName, item);
-  await docClient.send(new PutCommand({ TableName: tableName, Item: item }));
+export async function putItem(tableName, item, conditionExpression, expressionValues, expressionNames) {
+  if (IS_DEMO) return mockDb.putItem(tableName, item, conditionExpression, expressionValues, expressionNames);
+  await docClient.send(new PutCommand({
+    TableName: tableName,
+    Item: item,
+    ...(conditionExpression && { ConditionExpression: conditionExpression }),
+    ...(expressionValues && { ExpressionAttributeValues: expressionValues }),
+    ...(expressionNames && { ExpressionAttributeNames: expressionNames }),
+  }));
   return item;
 }
 
@@ -192,8 +230,10 @@ export async function queryItems(tableName, keyConditionExpression, expressionVa
  * @param {object} expressionValues - e.g. { ':name': 'Ram', ':status': 'active' }
  * @param {object} [expressionNames] - e.g. { '#name': 'name' }
  */
-export async function updateItem(tableName, key, updateExpression, expressionValues, expressionNames) {
-  if (IS_DEMO) return mockDb.updateItem(tableName, key, updateExpression, expressionValues, expressionNames);
+export async function updateItem(tableName, key, updateExpression, expressionValues, expressionNames, conditionExpression) {
+  if (IS_DEMO) {
+    return mockDb.updateItem(tableName, key, updateExpression, expressionValues, expressionNames, conditionExpression);
+  }
   const params = {
     TableName: tableName,
     Key: key,
@@ -203,6 +243,9 @@ export async function updateItem(tableName, key, updateExpression, expressionVal
   };
   if (expressionNames) {
     params.ExpressionAttributeNames = expressionNames;
+  }
+  if (conditionExpression) {
+    params.ConditionExpression = conditionExpression;
   }
   const result = await docClient.send(new UpdateCommand(params));
   return result.Attributes;
@@ -218,15 +261,51 @@ export async function deleteItem(tableName, key) {
   await docClient.send(new DeleteCommand({ TableName: tableName, Key: key }));
 }
 
+/** Safety cap on the number of items a full scan collects */
+const DEFAULT_SCAN_MAX_ITEMS = 10000;
+
 /**
- * Scan a table (use sparingly — prefer queries)
+ * Scan a whole table (use sparingly — prefer queries), following LastEvaluatedKey
+ * across pages until the table is exhausted or maxItems items have been collected.
  * @param {string} tableName
- * @param {object} [options]
+ * @param {object} [options] - Extra ScanCommand params (FilterExpression, etc.)
+ * @param {object} [scanOptions]
+ * @param {number} [scanOptions.maxItems=10000] - Stop after this many items
  */
-export async function scanTable(tableName, options = {}) {
-  if (IS_DEMO) return mockDb.scanTable(tableName, options);
+export async function scanTable(tableName, options = {}, { maxItems = DEFAULT_SCAN_MAX_ITEMS } = {}) {
+  if (IS_DEMO) return (await mockDb.scanTable(tableName, options)).slice(0, maxItems);
+  const items = [];
+  let startKey;
+  do {
+    const result = await docClient.send(new ScanCommand({
+      TableName: tableName,
+      ...options,
+      ...(startKey && { ExclusiveStartKey: startKey }),
+    }));
+    items.push(...(result.Items || []));
+    startKey = result.LastEvaluatedKey;
+  } while (startKey && items.length < maxItems);
+  if (items.length >= maxItems && startKey) {
+    console.warn(`[DynamoDB] scan of ${tableName} stopped at ${maxItems} items`);
+  }
+  return items.slice(0, maxItems);
+}
+
+/**
+ * Scan a single page of a table.
+ * @param {string} tableName
+ * @param {object} [options] - ScanCommand params (Limit, ExclusiveStartKey, ...)
+ * @returns {Promise<{ items: object[], lastEvaluatedKey: object|null }>}
+ */
+export async function scanPage(tableName, options = {}) {
+  if (IS_DEMO) {
+    const all = await mockDb.scanTable(tableName, options);
+    const start = options.ExclusiveStartKey ? Number(options.ExclusiveStartKey._offset) || 0 : 0;
+    const end = options.Limit ? start + options.Limit : all.length;
+    return { items: all.slice(start, end), lastEvaluatedKey: end < all.length ? { _offset: end } : null };
+  }
   const result = await docClient.send(new ScanCommand({ TableName: tableName, ...options }));
-  return result.Items || [];
+  return { items: result.Items || [], lastEvaluatedKey: result.LastEvaluatedKey || null };
 }
 
 // ─────────────────────────────────────────────────────────
@@ -245,8 +324,15 @@ export async function getWorkerByPhone(phoneNumber) {
   return items.length > 0 ? items[0] : null;
 }
 
-/** Get conversation state for a worker (most recent session) */
+/**
+ * Get conversation state for a worker. The canonical row is session_id = workerId; older
+ * deployments keyed onboarding rows by a random UUID, which can sort above the canonical row,
+ * so read the canonical row first and move a legacy row onto it the first time it is seen.
+ */
 export async function getConversationState(workerId) {
+  const canonical = await getItem(config.tables.conversation, { worker_id: workerId, session_id: workerId });
+  if (canonical) return canonical;
+
   const items = await queryItems(
     config.tables.conversation,
     'worker_id = :wid',
@@ -254,7 +340,13 @@ export async function getConversationState(workerId) {
     undefined,
     { ScanIndexForward: false, Limit: 1 },
   );
-  return items.length > 0 ? items[0] : null;
+  const legacy = items[0];
+  if (!legacy) return null;
+
+  const migrated = { ...legacy, session_id: workerId };
+  await putItem(config.tables.conversation, migrated);
+  await deleteItem(config.tables.conversation, { worker_id: workerId, session_id: legacy.session_id });
+  return migrated;
 }
 
 /** Save or update conversation state */
@@ -307,6 +399,7 @@ export default {
   updateItem,
   deleteItem,
   scanTable,
+  scanPage,
   getWorkerByPhone,
   getConversationState,
   saveConversationState,

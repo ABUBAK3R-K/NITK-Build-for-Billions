@@ -5,13 +5,11 @@
  */
 
 import { TextractClient, AnalyzeDocumentCommand } from '@aws-sdk/client-textract';
-import { RekognitionClient, DetectFacesCommand } from '@aws-sdk/client-rekognition';
 import config, { isDemoMode } from '../utils/config.js';
 import { withRetry } from '../utils/retryHelper.js';
 
 const IS_DEMO = isDemoMode();
 const textractClient = IS_DEMO ? null : new TextractClient({ region: config.aws.region });
-const rekognitionClient = IS_DEMO ? null : new RekognitionClient({ region: config.aws.region });
 
 // ─────────────────────────────────────────────────────────
 // Aadhaar OCR
@@ -26,7 +24,7 @@ export async function extractAadhaarFields(imageBuffer) {
   if (IS_DEMO) {
     console.log('[DocumentOCR DEMO] Returning mock Aadhaar fields');
     return {
-      name: 'Demo Worker', dob: '01/01/1990', aadhaar_number: '283077653455',
+      name: 'Demo Worker', dob: '01/01/1990', aadhaar_number: '283077653450',
       address: '123 Demo Street, Delhi', gender: 'Male', confidence: 85,
     };
   }
@@ -50,7 +48,7 @@ export async function extractAadhaarFields(imageBuffer) {
     name: findFieldValue(kvPairs, ['name', 'naam', 'नाम']) || extractNameFromText(allText),
     dob: findFieldValue(kvPairs, ['dob', 'date of birth', 'birth', 'जन्म तिथि', 'year of birth']) || extractDobFromText(allText),
     aadhaar_number: extractAadhaarNumber(allText),
-    address: findFieldValue(kvPairs, ['address', 'पता']) || extractAddressFromText(allText),
+    address: truncateBeforeAadhaarNumber(findFieldValue(kvPairs, ['address', 'पता']) || extractAddressFromText(allText)),
     gender: findFieldValue(kvPairs, ['gender', 'sex', 'लिंग']) || extractGenderFromText(allText),
     confidence: calculateAverageConfidence(textractResult),
   };
@@ -156,6 +154,7 @@ export function verhoeffChecksum(aadhaarNumber) {
 /**
  * Assess document image quality for OCR readability
  * Uses Textract confidence as a proxy for image quality.
+ * Textract errors are thrown, not scored as 0: a service outage is not an unclear photo.
  * @param {Buffer} imageBuffer
  * @returns {Promise<number>} Quality score 0-100
  */
@@ -165,21 +164,16 @@ export async function assessDocumentQuality(imageBuffer) {
     return 85;
   }
 
-  try {
-    const result = await withRetry(
-      () => textractClient.send(
-        new AnalyzeDocumentCommand({
-          Document: { Bytes: imageBuffer },
-          FeatureTypes: ['FORMS'],
-        }),
-      ),
-      { label: 'Textract:QualityAssess' },
-    );
-    return calculateAverageConfidence(result);
-  } catch (err) {
-    console.error('Quality assessment failed:', err.message);
-    return 0;
-  }
+  const result = await withRetry(
+    () => textractClient.send(
+      new AnalyzeDocumentCommand({
+        Document: { Bytes: imageBuffer },
+        FeatureTypes: ['FORMS'],
+      }),
+    ),
+    { label: 'Textract:QualityAssess' },
+  );
+  return calculateAverageConfidence(result);
 }
 
 // ─────────────────────────────────────────────────────────
@@ -332,11 +326,33 @@ function calculateAverageConfidence(textractResult) {
 // Text Extraction Helpers
 // ─────────────────────────────────────────────────────────
 
-/** Extract 12-digit Aadhaar number from text */
-function extractAadhaarNumber(text) {
-  // Aadhaar format: XXXX XXXX XXXX or XXXX-XXXX-XXXX or XXXXXXXXXXXX
-  const match = text.match(/\b(\d{4}[\s-]?\d{4}[\s-]?\d{4})\b/);
-  return match ? match[1].replace(/[\s-]/g, '') : '';
+// A digit run shaped like an Aadhaar number: XXXX XXXX XXXX, XXXX-XXXX-XXXX or XXXXXXXXXXXX
+const AADHAAR_LIKE = /\d{4}[ -]?\d{4}[ -]?\d{4}/;
+
+/**
+ * Extract the 12-digit Aadhaar number from OCR text: the first candidate that passes the
+ * Verhoeff checksum. Candidates that are part of a longer digit run (16-digit VIDs, timestamps,
+ * phone + pin runs) and numbers starting with 0 or 1 (never issued) are skipped.
+ * @returns {string} the number, or '' if no valid candidate was found
+ */
+export function extractAadhaarNumber(text) {
+  // Groups are separated by a space or dash, never a line break (Textract lines are joined by
+  // newlines). Not preceded by a digit or by a lone 4-digit group (a VID's tail); not followed by more digits.
+  const candidates = String(text || '').matchAll(
+    /(?<!\d)(?<!(?:^|\D)\d{4}[ -])([2-9]\d{3})[ -]?(\d{4})[ -]?(\d{4})(?![ -]?\d)/g,
+  );
+  for (const m of candidates) {
+    const number = m[1] + m[2] + m[3];
+    if (verhoeffChecksum(number)) return number;
+  }
+  return '';
+}
+
+/** Cut text at the first Aadhaar-like digit run, so a full number never lands in stored fields */
+function truncateBeforeAadhaarNumber(text) {
+  const match = String(text || '').match(AADHAAR_LIKE);
+  if (!match) return text || '';
+  return text.slice(0, match.index).replace(/[\s,:;-]+$/, '').trim();
 }
 
 /** Extract date of birth from text */
@@ -372,12 +388,20 @@ function extractAddressFromText(text) {
     if (line.toLowerCase().includes('address') || line.includes('पता')) {
       capturing = true;
       const afterColon = line.split(/[:：]/)[1];
-      if (afterColon) address.push(afterColon.trim());
+      if (afterColon) {
+        const part = truncateBeforeAadhaarNumber(afterColon);
+        if (part) address.push(part);
+        if (AADHAAR_LIKE.test(afterColon)) break;
+      }
       continue;
     }
     if (capturing) {
-      // Stop at next field or Aadhaar number
-      if (/\b\d{4}\s?\d{4}\s?\d{4}\b/.test(line)) break;
+      // Stop at the Aadhaar number (spaced, dashed or plain), keeping any address text before it
+      if (AADHAAR_LIKE.test(line)) {
+        const part = truncateBeforeAadhaarNumber(line);
+        if (part.length > 5) address.push(part);
+        break;
+      }
       if (line.length > 5) address.push(line.trim());
       if (address.length >= 3) break;
     }
