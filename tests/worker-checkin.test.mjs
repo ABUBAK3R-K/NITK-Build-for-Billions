@@ -138,9 +138,21 @@ test('approved and duplicate replies carry voice and days logged / remaining', a
   await onboard(phone);
   const ok = await checkIn(phone);
   assert.match(ok.replies[0], /Din 1 log hua. 2 din aur baaki/);
-  const dup = await checkIn(phone);
-  assert.match(dup.replies[0], /pehle se log/);
-  assert.match(dup.replies[0], /1 din log hue, 2 din aur baaki/);
+  
+  // Use a different image ID 'c2' to bypass the new Phase 2 exact-image duplicate check,
+  // so we can test the same-day duplicate check logic in attendanceProcessor.js
+  H.wa.mediaBytes = Buffer.from('unique-bytes-for-c2');
+  const imgRes = await send(phone, M.image('c2'));
+  // console.error('IMG RES:', imgRes.replies);
+  
+  const locRes = await send(phone, M.location());
+  // console.error('LOC RES:', locRes.replies);
+  
+  const dup = await send(phone, M.text('ok'));
+  // console.error('DUP RES:', dup.replies);
+  
+  assert.match(dup.replies[0] || '', /pehle se log/);
+  assert.match(dup.replies[0] || '', /1 din log hue, 2 din aur baaki/);
   assert.ok(dup.replies.includes('[audio]'));
 });
 

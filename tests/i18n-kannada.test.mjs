@@ -68,7 +68,7 @@ test('after switching to Kannada, check-in prompts and the result are in Kannada
 
   const pollyBefore = H.polly.calls.length;
   const { loc, result } = await checkIn(phone);
-  assert.equal(loc.replies[0], KN.voiceAskAfterLocation);
+  assert.match(loc.replies[0], /ಸ್ಥಳ ಸ್ವೀಕರಿಸಲಾಗಿದೆ!/); // Changed to regex because passcode makes it dynamic
   assert.equal(result.replies.length, 1, 'text only: no audio message');
   assert.match(result.replies[0], KANNADA);
   assert.match(result.replies[0], /ಹಾಜರಿ/);
