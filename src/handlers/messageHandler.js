@@ -19,6 +19,8 @@ import {
   saveConversationState,
   updateItem,
   queryItems,
+  getItem,
+  getWorkerAttendanceLogs,
 } from '../utils/dynamodb.js';
 import {
   parseWebhookMessages,
@@ -29,6 +31,8 @@ import {
   sendDocumentMessage,
   sendImageMessage,
   sendLocationRequest,
+  sendListMenu,
+  sendReplyButtons,
 } from '../utils/whatsapp.js';
 import { uploadWorkerMedia, generatePresignedUrl } from '../utils/s3.js';
 import { putItemIfAbsent } from '../services/conditionalWrite.js';
@@ -219,7 +223,9 @@ async function handleIncomingMessage(message) {
   const { profile_status, worker_id: workerId } = existingWorker;
 
   // "English" / "Hindi" / "ಕನ್ನಡ" switches language at any step
-  const switchTo = message.type === 'text' ? parseLanguageSwitch(message.text) : null;
+  const switchTo = message.type === 'text'
+    ? LANGUAGE_BUTTONS[message.buttonId] || parseLanguageSwitch(message.text)
+    : null;
   if (switchTo) {
     return await handleLanguageSwitch(workerId, existingWorker, message, switchTo);
   }
@@ -597,6 +603,10 @@ async function handleActiveWorker(workerId, worker, message) {
 
   // Text messages — check if we're in attendance flow first
   if (message.type === 'text') {
+    // Menu and language taps are commands, never the answer to a check-in step
+    if (message.buttonId && BUTTON_INTENTS[message.buttonId]) {
+      return await handleActiveWorkerText(workerId, worker, message);
+    }
     // If awaiting voice, "ok"/"done"/"skip"/any short text skips voice and processes attendance
     if (attendanceStep === 'awaiting_voice' && state?.pending_selfie_key) {
       const lower = (message.text || '').toLowerCase().trim();
@@ -701,6 +711,12 @@ async function handleActiveWorkerText(workerId, worker, message) {
   const language = worker.preferred_language || 'hi';
   const text = (message.text || '').trim();
 
+  // A tapped menu row or button carries its id; route by id so translated titles never matter
+  const tapped = message.buttonId && BUTTON_INTENTS[message.buttonId];
+  if (tapped) {
+    return await executeIntent({ ...tapped, confidence: 100, source: 'button', transcript: text }, workerId, worker, phoneNumber, language);
+  }
+
   // Detect intent and execute
   const intent = await detectIntent(text, language);
   return await executeIntent(intent, workerId, worker, phoneNumber, language);
@@ -771,7 +787,24 @@ const LEX_INTENT_MAP = {
   FallbackIntent: null, // Lex doesn't know → go to the LLM
 };
 
-const LLM_INTENTS = new Set(['check_progress', 'request_certificate', 'log_attendance', 'help', 'greeting']);
+const LLM_INTENTS = new Set([
+  'check_progress', 'request_certificate', 'log_attendance', 'help', 'greeting',
+  'today_status', 'my_days', 'change_language', 'menu',
+]);
+
+// Self-service menu rows and language buttons: id → intent
+const BUTTON_INTENTS = {
+  menu_today: { type: 'today_status' },
+  menu_days: { type: 'my_days' },
+  menu_progress: { type: 'check_progress' },
+  menu_card: { type: 'request_certificate' },
+  menu_checkin: { type: 'log_attendance' },
+  menu_language: { type: 'change_language' },
+  menu_help: { type: 'help' },
+};
+
+// Language picker buttons → language code (handled by the any-step language switch)
+const LANGUAGE_BUTTONS = { lang_kn: 'kn', lang_hi: 'hi', lang_en: 'en' };
 const DEMO_INTENTS = new Set(['demo_fail', 'demo_certificate']);
 
 function isDemoPhone(phoneNumber) {
@@ -781,7 +814,11 @@ function isDemoPhone(phoneNumber) {
 
 // Checked in order: certificate before progress, as for the romanized keywords
 const KANNADA_INTENT_KEYWORDS = [
-  ['request_certificate', /ಸರ್ಟಿಫಿಕೇಟ್|ಪ್ರಮಾಣ ?ಪತ್ರ/u],
+  ['menu', /^ಮೆನು$/u],
+  ['today_status', /ಇಂದಿನ ಹಾಜರಿ|^ಇಂದು$|^ಇವತ್ತು$/u],
+  ['my_days', /ನನ್ನ ದಿನ/u],
+  ['change_language', /ಭಾಷೆ/u],
+  ['request_certificate', /ಸರ್ಟಿಫಿಕೇಟ್|ಪ್ರಮಾಣ ?ಪತ್ರ|ಕಾರ್ಡ್/u],
   ['check_progress', /ಪ್ರಗತಿ|ಪ್ರೋಗ್ರೆಸ್|ಎಷ್ಟು ದಿನ|ಸ್ಟೇಟಸ್/u],
   ['log_attendance', /ಹಾಜರಿ|ಸೆಲ್ಫಿ/u],
   ['help', /ಸಹಾಯ|ಹೆಲ್ಪ್/u],
@@ -800,8 +837,23 @@ async function detectIntent(text, language) {
     return { type: 'demo_certificate', confidence: 99, source: 'keyword', transcript: text };
   }
 
+  // Self-service commands (short phrases, so work descriptions like "aaj maine plaster kiya" don't match)
+  const phrase = lower.replace(/[?!.]+$/, '').trim();
+  if (/^(menu|options|मेनू)$/.test(phrase)) {
+    return { type: 'menu', confidence: 99, source: 'keyword', transcript: text };
+  }
+  if (/^(aaj|today|aaj ki haziri|aaj ka status|today status|aaj haziri|आज|आज की हाज़िरी|आज की हाजिरी)$/.test(phrase)) {
+    return { type: 'today_status', confidence: 95, source: 'keyword', transcript: text };
+  }
+  if (/\b(mere din|my days|history|din dikhao|mera record|my record|meri haziri)\b|मेरे दिन/.test(lower)) {
+    return { type: 'my_days', confidence: 95, source: 'keyword', transcript: text };
+  }
+  if (/\b(language|bhasha|bhaasha)\b|भाषा/.test(lower)) {
+    return { type: 'change_language', confidence: 95, source: 'keyword', transcript: text };
+  }
+
   // Certificate before progress: "certificate status" / "certificate kab milega" is about the certificate
-  if (/\b(certificate|praman|patra|download|sanad)\b/.test(lower)) {
+  if (/\b(certificate|praman|patra|download|sanad|card)\b/.test(lower)) {
     return { type: 'request_certificate', confidence: 95, source: 'keyword', transcript: text };
   }
   // Only explicit day-count phrases: a bare "din" ("aaj ka din accha tha") is not a progress query
@@ -879,6 +931,10 @@ Possible intents:
 - log_attendance: Worker wants to mark today's attendance
 - help: Worker is confused, asking what they can do, or needs guidance
 - greeting: Worker is just saying hello
+- today_status: Worker asks whether today's attendance is done or verified
+- my_days: Worker wants to see the list or history of days they worked
+- change_language: Worker wants replies in a different language
+- menu: Worker wants to see the options or menu
 - other: Anything else (describe briefly)
 
 Respond in EXACTLY this JSON format (no markdown):
@@ -1022,6 +1078,9 @@ async function executeIntent(intent, workerId, worker, phoneNumber, language) {
       const existingCert = await findLatestCertificate(workerId);
       if (existingCert) {
         await sendCertificateDocument(phoneNumber, existingCert, language);
+        if (existingCert.credential_jwt && existingCert.qr_s3_key) {
+          await sendCredentialQr(phoneNumber, existingCert.qr_s3_key, language);
+        }
         return apiResponse(200, { status: 'certificate_resent', workerId, intent: intent.type });
       }
       if (daysLogged < threshold) {
@@ -1058,6 +1117,91 @@ async function executeIntent(intent, workerId, worker, phoneNumber, language) {
       return apiResponse(200, { status: 'greeting_sent', workerId, intent: intent.type });
     }
 
+    case 'menu': {
+      await sendSelfServiceMenu(phoneNumber, language);
+      return apiResponse(200, { status: 'menu_sent', workerId, intent: intent.type });
+    }
+
+    case 'today_status': {
+      const log = await getItem(config.tables.attendance, { worker_id: workerId, log_date: istDate() });
+      const status = log?.verification_status;
+      const site = log?.site_name && log.site_name !== 'Unknown Site' ? log.site_name : '';
+      let responseText;
+      if (status === 'auto_approved' || status === 'approved') {
+        responseText = t(language, {
+          en: `Today's attendance is verified ✅${site ? ` (${site})` : ''}`,
+          hi: `Aaj ki haziri verify ho gayi ✅${site ? ` (${site})` : ''}`,
+          kn: KN.todayVerified(site),
+        });
+      } else if (status === 'pending_review') {
+        responseText = t(language, {
+          en: "Today's attendance is under admin review ⏳. We will let you know soon.",
+          hi: 'Aaj ki haziri admin review mein hai ⏳. Jaldi batayenge.',
+          kn: KN.todayPending,
+        });
+      } else if (status === 'rejected') {
+        responseText = t(language, {
+          en: "Today's attendance could not be verified ❌. Please send a selfie again.",
+          hi: 'Aaj ki haziri verify nahi ho saki ❌. Kripya dobara selfie bhejiye.',
+          kn: KN.todayRejected,
+        });
+      } else {
+        responseText = t(language, {
+          en: 'No attendance yet today. Send a selfie to mark it.',
+          hi: 'Aaj abhi haziri nahi lagi. Haziri ke liye selfie bhejiye.',
+          kn: KN.todayNone,
+        });
+      }
+      await sendTextAndVoice(phoneNumber, workerId, responseText, language, 'today-status');
+      return apiResponse(200, { status: 'today_status_sent', workerId, intent: intent.type, attendance: status || 'none' });
+    }
+
+    case 'my_days': {
+      const logs = await getWorkerAttendanceLogs(workerId);
+      const verifiedDays = new Set(
+        logs.filter((l) => l.verification_status === 'auto_approved' || l.verification_status === 'approved').map((l) => l.log_date),
+      ).size;
+      let responseText;
+      if (logs.length === 0) {
+        responseText = t(language, {
+          en: 'No attendance yet. Send a selfie for your first day.',
+          hi: 'Abhi tak koi haziri nahi. Pehle din ke liye selfie bhejiye.',
+          kn: KN.myDaysEmpty,
+        });
+      } else {
+        const icon = { auto_approved: '✅', approved: '✅', pending_review: '⏳', rejected: '❌' };
+        const lines = [...logs]
+          .sort((a, b) => String(b.log_date).localeCompare(String(a.log_date)))
+          .slice(0, 7)
+          .map((l) => {
+            const [, mm, dd] = String(l.log_date).split('-');
+            const site = l.site_name && l.site_name !== 'Unknown Site' ? ` · ${l.site_name}` : '';
+            return `${icon[l.verification_status] || '•'} ${dd}/${mm}${site}`;
+          });
+        const header = t(language, {
+          en: `${verifiedDays} of ${threshold} days verified. Recent attendance:`,
+          hi: `${threshold} mein se ${verifiedDays} din verify hue. Haal ki haziri:`,
+          kn: KN.myDaysHeader(verifiedDays, threshold),
+        });
+        responseText = `${header}\n${lines.join('\n')}`;
+      }
+      await sendTextMessage(phoneNumber, responseText);
+      return apiResponse(200, { status: 'my_days_sent', workerId, intent: intent.type, verifiedDays });
+    }
+
+    case 'change_language': {
+      await sendReplyButtons(phoneNumber, t(language, {
+        en: 'Choose your language:',
+        hi: 'Apni bhasha chuniye:',
+        kn: KN.languagePrompt,
+      }), [
+        { id: 'lang_kn', title: 'ಕನ್ನಡ' },
+        { id: 'lang_hi', title: 'हिन्दी' },
+        { id: 'lang_en', title: 'English' },
+      ]);
+      return apiResponse(200, { status: 'language_prompt_sent', workerId, intent: intent.type });
+    }
+
     case 'help':
     default: {
       const responseText = t(language, {
@@ -1066,6 +1210,7 @@ async function executeIntent(intent, workerId, worker, phoneNumber, language) {
         kn: KN.help(name, daysLogged, daysRemaining),
       });
       await sendTextAndVoice(phoneNumber, workerId, responseText, language, 'help');
+      await sendSelfServiceMenu(phoneNumber, language);
       return apiResponse(200, { status: 'help_sent', workerId, intent: intent.type });
     }
   }
@@ -1288,6 +1433,32 @@ async function triggerCertificateGeneration(workerId, phoneNumber, language) {
   } catch (err) {
     console.error('Certificate generation failed:', err.message);
     // Non-blocking: attendance is already logged, certificate can be retried
+  }
+}
+
+/** Tap-able self-service menu; each row id maps to an intent in BUTTON_INTENTS */
+async function sendSelfServiceMenu(phoneNumber, language = 'hi') {
+  const rows = [
+    ['menu_today', "Today's attendance", 'Aaj ki haziri', KN.menuRows.today],
+    ['menu_days', 'My work days', 'Mere din', KN.menuRows.days],
+    ['menu_progress', 'My progress', 'Mera progress', KN.menuRows.progress],
+    ['menu_card', 'My certificate', 'Mera certificate', KN.menuRows.card],
+    ['menu_checkin', 'Mark attendance', 'Haziri lagao', KN.menuRows.checkin],
+    ['menu_language', 'Change language', 'Bhasha badlo', KN.menuRows.language],
+    ['menu_help', 'Help', 'Madad', KN.menuRows.help],
+  ].map(([id, en, hi, kn]) => ({ id, title: t(language, { en, hi, kn }) }));
+  try {
+    await sendListMenu(phoneNumber, {
+      body: t(language, {
+        en: 'What do you need? Tap the button below to choose.',
+        hi: 'Aapko kya chahiye? Neeche button dabakar chuniye.',
+        kn: KN.menuBody,
+      }),
+      button: t(language, { en: 'Options', hi: 'Vikalp', kn: KN.menuButton }),
+      rows,
+    });
+  } catch (err) {
+    console.warn('[Menu] List message failed:', err.message);
   }
 }
 
