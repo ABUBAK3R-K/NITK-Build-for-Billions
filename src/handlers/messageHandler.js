@@ -327,10 +327,22 @@ async function handleNewWorker(phoneNumber, message) {
 // Consent gate (PRD FR-1): nothing is collected before "I agree"
 // ─────────────────────────────────────────────────────────
 
-async function handleConsentGate(worker, message, switchTo) {
+// A regional greeting before consent picks the notice language, as it does for a new number.
+// English greetings ("hi") keep the saved language, since Hindi speakers type them too.
+const GREETING_LANGUAGES = [
+  ['kn', /^\s*(namaskara|ನಮಸ್ಕಾರ)/iu],
+  ['hi', /^\s*(namaste|namaskar|नमस्ते|नमस्कार)/iu],
+];
+
+function greetingLanguage(text) {
+  return GREETING_LANGUAGES.find(([, pattern]) => pattern.test(text || ''))?.[0] || null;
+}
+
+async function handleConsentGate(worker, message, explicitSwitch) {
   const phoneNumber = message.from;
   const workerId = worker.worker_id;
   let language = worker.preferred_language || 'hi';
+  const switchTo = explicitSwitch || (message.type === 'text' ? greetingLanguage(message.text) : null);
 
   if (switchTo && switchTo !== language) {
     language = switchTo;

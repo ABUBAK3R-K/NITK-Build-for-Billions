@@ -112,6 +112,25 @@ test('a language switch before agreeing re-sends the notice in that language', a
   assert.equal(H.worker(phone).consent_version, undefined, 'switching is not agreeing');
 });
 
+test('a saved worker greeting in Hindi or Kannada gets the notice in that language', async () => {
+  const phone = '919600000006';
+  await db.putItem(config.tables.workers, {
+    worker_id: 'W-LEGACY-EN', phone_number: phone, name: 'Asha', preferred_language: 'en', profile_status: 'active',
+  });
+  const { KN } = await import('../src/utils/i18n.js');
+
+  const hi = await send(phone, M.text('namaste'));
+  assert.equal(H.worker(phone).preferred_language, 'hi');
+  assert.match(hi.replies[0], /Main sahmat hoon/);
+
+  const kn = await send(phone, M.text('Namaskara'));
+  assert.equal(H.worker(phone).preferred_language, 'kn');
+  assert.equal(kn.replies[0], `[buttons] ${KN.consentNotice}`);
+
+  await send(phone, M.text('hi'));
+  assert.equal(H.worker(phone).preferred_language, 'kn', 'an English greeting keeps the saved language');
+});
+
 // ── Officer API ────────────────────────────────────────
 
 test('officer view is audited and reports no decision yet', async () => {
