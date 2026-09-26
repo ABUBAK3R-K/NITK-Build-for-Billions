@@ -63,7 +63,7 @@ async function processFaceVerification(event) {
   const worker = await getItem(config.tables.workers, { worker_id: workerId });
   if (!worker || !worker.face_vector) {
     // In dev mode, auto-pass face verification if no enrolled face
-    if (config.environment === 'dev') {
+    if (isDemoMode()) {
       console.log('[AttendanceProcessor DEV] No enrolled face, auto-passing face verify');
       return { success: true, confidence: 85, faceMatch: true, details: { similarity: 85, qualityBrightness: 75, qualitySharpness: 80 } };
     }
@@ -140,7 +140,7 @@ async function processGeoVerification(event) {
 
   if (!latitude || !longitude) {
     // In dev mode, auto-pass geo verification if no GPS data (WhatsApp strips EXIF)
-    if (config.environment === 'dev') {
+    if (isDemoMode()) {
       console.log('[AttendanceProcessor DEV] No GPS data, auto-passing geo verify');
       return {
         success: true,
@@ -279,7 +279,7 @@ Respond in EXACTLY this JSON format (no markdown, no code blocks):
   } catch (err) {
     console.error('Voice verification failed:', err.message);
     // In dev mode, auto-pass voice verification on failure
-    if (config.environment === 'dev') {
+    if (isDemoMode()) {
       console.log('[AttendanceProcessor DEV] Voice analysis failed, auto-passing');
       return { success: true, confidence: 80, workDetails: { activity: 'construction work', location_mention: 'site', is_work_related: true } };
     }

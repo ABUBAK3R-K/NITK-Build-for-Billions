@@ -18,6 +18,16 @@ Parameters:
     Default: 3
     Description: Days required for certificate (3 for demo, 90 for prod)
 
+  PortalUrl:
+    Type: String
+    Default: ''
+    Description: Public URL of the dashboard / officer portal (e.g. https://main.xxxx.amplifyapp.com); certificate QR codes link to <PortalUrl>/verify/<hash>
+
+  DemoPhoneNumbers:
+    Type: String
+    Default: ''
+    Description: Comma-separated team phone numbers (e.g. 919876543210) allowed to use the demo keywords
+
   WhatsAppApiToken:
     Type: String
     Default: ''
@@ -54,15 +64,15 @@ Parameters:
 
   JwtSecret:
     Type: String
-    Default: 'dev-jwt-secret-change-me'
     NoEcho: true
-    Description: Secret key for signing JWT access tokens
+    MinLength: 32
+    Description: Secret key for signing JWT access tokens (required, at least 32 random characters)
 
   JwtRefreshSecret:
     Type: String
-    Default: 'dev-refresh-secret-change-me'
     NoEcho: true
-    Description: Secret key for signing JWT refresh tokens
+    MinLength: 32
+    Description: Secret key for signing JWT refresh tokens (required, at least 32 random characters)
 
   AdminSeedSecret:
     Type: String
@@ -84,6 +94,8 @@ Globals:
       Variables:
         ENVIRONMENT: !Ref Environment
         CERTIFICATE_THRESHOLD: !Ref CertificateThreshold
+        DEMO_PHONE_NUMBERS: !Ref DemoPhoneNumbers
+        PORTAL_URL: !Ref PortalUrl
         WORKERS_TABLE: !Ref WorkersTable
         ATTENDANCE_TABLE: !Ref AttendanceLogsTable
         SITES_TABLE: !Ref SitesTable

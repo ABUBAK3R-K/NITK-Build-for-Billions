@@ -192,7 +192,7 @@ export async function queryItems(tableName, keyConditionExpression, expressionVa
  * @param {object} expressionValues - e.g. { ':name': 'Ram', ':status': 'active' }
  * @param {object} [expressionNames] - e.g. { '#name': 'name' }
  */
-export async function updateItem(tableName, key, updateExpression, expressionValues, expressionNames) {
+export async function updateItem(tableName, key, updateExpression, expressionValues, expressionNames, conditionExpression) {
   if (IS_DEMO) return mockDb.updateItem(tableName, key, updateExpression, expressionValues, expressionNames);
   const params = {
     TableName: tableName,
@@ -203,6 +203,9 @@ export async function updateItem(tableName, key, updateExpression, expressionVal
   };
   if (expressionNames) {
     params.ExpressionAttributeNames = expressionNames;
+  }
+  if (conditionExpression) {
+    params.ConditionExpression = conditionExpression;
   }
   const result = await docClient.send(new UpdateCommand(params));
   return result.Attributes;

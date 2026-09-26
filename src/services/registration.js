@@ -104,8 +104,9 @@ export async function handleGreeting(phoneNumber, messageText) {
     updated_at: now,
   });
 
-  // Create conversation state
-  const sessionId = uuidv4();
+  // Create conversation state. One row per worker (session_id = workerId), shared with the
+  // attendance flow, so a stale onboarding row can never shadow a later check-in step.
+  const sessionId = workerId;
   await saveConversationState(workerId, sessionId, {
     current_step: 'awaiting_name',
     preferred_language: language,
@@ -486,6 +487,12 @@ export async function finalizeRegistration(workerId, language = 'hi') {
     'SET profile_status = :status, registration_completed = :ts, updated_at = :ts2',
     { ':status': 'active', ':ts': now, ':ts2': now },
   );
+
+  // Clear the onboarding step so the next message starts the attendance flow cleanly
+  await saveConversationState(workerId, workerId, {
+    current_step: 'active',
+    preferred_language: language,
+  });
 
   // Generate completion message
   const responseText = language === 'en'

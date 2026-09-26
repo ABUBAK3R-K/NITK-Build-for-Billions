@@ -10,9 +10,9 @@ import {
   StartTranscriptionJobCommand,
   GetTranscriptionJobCommand,
 } from '@aws-sdk/client-transcribe';
-import config from '../utils/config.js';
+import config, { isDemoMode } from '../utils/config.js';
 import { complete } from '../providers/llm.js';
-import { uploadProcessedAudio, uploadWorkerMedia } from '../utils/s3.js';
+import { uploadProcessedAudio, uploadWorkerMedia, downloadFromS3 } from '../utils/s3.js';
 import { generatePresignedUrl } from '../utils/s3.js';
 import { withRetry } from '../utils/retryHelper.js';
 
@@ -81,17 +81,17 @@ const TRANSCRIBE_LANGUAGE_MAP = {
  * @param {Buffer} audioBuffer - Audio file buffer (ogg/wav/mp3)
  * @param {string} language - ISO 639-1 code
  * @param {string} [workerId] - Worker ID for S3 path
- * @returns {Promise<string>} Transcribed text
+ * @returns {Promise<string>} Transcribed text, or '' if nothing could be transcribed
  */
 export async function transcribeVoice(audioBuffer, language = 'hi', workerId = 'temp') {
   // Demo mode: return mock transcription
-  if (config.environment === 'dev' && (!audioBuffer || audioBuffer.length < 100)) {
+  if (isDemoMode() && (!audioBuffer || audioBuffer.length < 100)) {
     console.log('[VoiceProcessor DEMO] Returning mock transcription');
     return 'Ram Kumar';
   }
 
   if (!audioBuffer || audioBuffer.length < 100) {
-    return 'Unknown';
+    return '';
   }
 
   try {
@@ -102,6 +102,7 @@ export async function transcribeVoice(audioBuffer, language = 'hi', workerId = '
 
     // Step 2: Start Transcribe job
     const jobName = `nirman-${workerId}-${Date.now()}`;
+    const outputKey = `transcriptions/${jobName}.json`;
     const languageCode = TRANSCRIBE_LANGUAGE_MAP[language] || 'hi-IN';
 
     await withRetry(
@@ -112,7 +113,7 @@ export async function transcribeVoice(audioBuffer, language = 'hi', workerId = '
           MediaFormat: 'ogg',
           Media: { MediaFileUri: s3Uri },
           OutputBucketName: config.buckets.mediaProcessed,
-          OutputKey: `transcriptions/${jobName}.json`,
+          OutputKey: outputKey,
         }),
       ),
       { label: 'Transcribe:StartJob' },
@@ -130,13 +131,11 @@ export async function transcribeVoice(audioBuffer, language = 'hi', workerId = '
       const jobStatus = status.TranscriptionJob?.TranscriptionJobStatus;
 
       if (jobStatus === 'COMPLETED') {
-        // Fetch transcript from the result
-        const transcriptUri = status.TranscriptionJob?.Transcript?.TranscriptFileUri;
-        if (transcriptUri) {
-          const response = await fetch(transcriptUri);
-          const data = await response.json();
-          transcript = data.results?.transcripts?.[0]?.transcript || '';
-        }
+        // The output bucket is private, so read the result with the S3 SDK (a plain fetch of
+        // TranscriptFileUri returns 403)
+        const body = await downloadFromS3(config.buckets.mediaProcessed, outputKey);
+        const data = JSON.parse(body.toString('utf-8'));
+        transcript = data.results?.transcripts?.[0]?.transcript || '';
         break;
       }
 
@@ -148,26 +147,13 @@ export async function transcribeVoice(audioBuffer, language = 'hi', workerId = '
 
     if (transcript) {
       console.log(`[Transcribe] Result: "${transcript.substring(0, 100)}"`);
-      return transcript;
+    } else {
+      console.warn('[Transcribe] No transcript produced');
     }
-
-    // Fallback to the LLM if Transcribe didn't produce a result
-    console.warn('[Transcribe] No result, falling back to LLM text analysis');
-    return await transcribeFallback(language);
+    return transcript;
   } catch (err) {
-    console.error('Transcribe failed, using fallback:', err.message);
-    return await transcribeFallback(language);
-  }
-}
-
-/** Fallback transcription using the LLM when Transcribe fails */
-async function transcribeFallback(language) {
-  try {
-    const prompt = `An Indian construction worker sent a voice note in ${language === 'hi' ? 'Hindi' : 'English'}. They are likely stating their name or describing their daily work at a construction site. Generate a realistic short transcription (1-2 sentences). Return ONLY the transcription text.`;
-    const response = await complete({ prompt, maxTokens: 100 });
-    return response.trim() || 'Unknown';
-  } catch {
-    return 'Unknown';
+    console.error('Transcribe failed:', err.message);
+    return '';
   }
 }
 

@@ -4,7 +4,20 @@
 
 const API_BASE_URL = import.meta.env.VITE_API_URL || '';
 
-async function refreshAccessToken() {
+// The backend rotates refresh tokens, so concurrent 401s must share one refresh call;
+// a second call with the same (now revoked) token would fail and log the user out.
+let refreshInFlight = null;
+
+function refreshAccessToken() {
+  if (!refreshInFlight) {
+    refreshInFlight = doRefresh().finally(() => {
+      refreshInFlight = null;
+    });
+  }
+  return refreshInFlight;
+}
+
+async function doRefresh() {
   const refreshToken = localStorage.getItem('refreshToken');
   if (!refreshToken) return null;
 
@@ -41,7 +54,11 @@ async function request(url, options = {}) {
 
   // On 401, attempt silent refresh
   if (res.status === 401 && accessToken) {
-    const newToken = await refreshAccessToken();
+    // If another request already refreshed while this one was in flight, reuse its token
+    const storedToken = localStorage.getItem('accessToken');
+    const newToken = storedToken && storedToken !== accessToken
+      ? storedToken
+      : await refreshAccessToken();
     if (newToken) {
       headers['Authorization'] = `Bearer ${newToken}`;
       res = await fetch(`${API_BASE_URL}${url}`, { ...options, headers });

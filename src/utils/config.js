@@ -9,10 +9,23 @@ const config = Object.freeze({
   environment: process.env.ENVIRONMENT || 'dev',
   certificateThreshold: parseInt(process.env.CERTIFICATE_THRESHOLD || '3', 10),
 
+  // Public URL of the dashboard / officer portal (no trailing slash); certificate QR codes link here
+  portalUrl: (process.env.PORTAL_URL || '').replace(/\/+$/, ''),
+
+  // Team phone numbers (digits only, comma-separated) allowed to use the "demo cert" /
+  // "test review" keywords. Empty means nobody can.
+  demoPhoneNumbers: (process.env.DEMO_PHONE_NUMBERS || '')
+    .split(',')
+    .map((n) => n.replace(/\D/g, ''))
+    .filter(Boolean),
+
   // JWT Auth
   jwt: {
-    secret: process.env.JWT_SECRET || 'dev-jwt-secret-change-me',
-    refreshSecret: process.env.JWT_REFRESH_SECRET || 'dev-refresh-secret-change-me',
+    // The dev fallbacks apply only to local runs. On Lambda a missing secret stays empty, so
+    // signing fails and every token is rejected instead of trusting a publicly known key.
+    secret: process.env.JWT_SECRET || (process.env.AWS_LAMBDA_FUNCTION_NAME ? '' : 'dev-jwt-secret-change-me'),
+    refreshSecret: process.env.JWT_REFRESH_SECRET
+      || (process.env.AWS_LAMBDA_FUNCTION_NAME ? '' : 'dev-refresh-secret-change-me'),
     accessTokenExpiry: '15m',
     refreshTokenExpiry: '7d',
   },

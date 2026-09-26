@@ -424,17 +424,36 @@ async function handleReviewAction(event) {
 
   const newStatus = action === 'approve' ? 'approved' : 'rejected';
 
-  await updateItem(
-    config.tables.attendance,
-    { worker_id: workerId, log_date: logDate },
-    'SET verification_status = :status, admin_action = :action, admin_justification = :just, reviewed_at = :ts',
-    {
-      ':status': newStatus,
-      ':action': action,
-      ':just': sanitizedJustification,
-      ':ts': new Date().toISOString(),
-    },
-  );
+  // Only logs still waiting in the review queue can be decided, so a day is never counted twice
+  const log = await getItem(config.tables.attendance, { worker_id: workerId, log_date: logDate });
+  if (!log) {
+    return apiResponse(404, { error: 'Attendance log not found' });
+  }
+  if (log.verification_status !== 'pending_review') {
+    return apiResponse(409, { error: `Attendance log already ${log.verification_status}` });
+  }
+
+  try {
+    await updateItem(
+      config.tables.attendance,
+      { worker_id: workerId, log_date: logDate },
+      'SET verification_status = :status, admin_action = :action, admin_justification = :just, reviewed_at = :ts',
+      {
+        ':status': newStatus,
+        ':action': action,
+        ':just': sanitizedJustification,
+        ':ts': new Date().toISOString(),
+        ':pending': 'pending_review',
+      },
+      undefined,
+      'verification_status = :pending',
+    );
+  } catch (err) {
+    if (err.name === 'ConditionalCheckFailedException') {
+      return apiResponse(409, { error: 'Attendance log was already reviewed' });
+    }
+    throw err;
+  }
 
   // Increment days logged when admin approves (matches auto_approved behavior)
   if (action === 'approve') {

@@ -11,7 +11,7 @@
  */
 
 import { LexRuntimeV2Client, RecognizeTextCommand } from '@aws-sdk/client-lex-runtime-v2';
-import config, { apiResponse } from '../utils/config.js';
+import config, { apiResponse, isDemoMode } from '../utils/config.js';
 import { getWorkerByPhone, getConversationState, saveConversationState, getItem } from '../utils/dynamodb.js';
 import {
   parseWebhookMessage,
@@ -174,7 +174,7 @@ async function handleOnboardingWorker(workerId, worker, message) {
   const state = await getConversationState(workerId);
   const currentStep = state?.current_step || 'awaiting_name';
   const retryCount = state?.retry_count || 0;
-  const sessionId = state?.session_id || worker.worker_id;
+  const sessionId = worker.worker_id;
 
   console.log(`Onboarding step for ${workerId}: ${currentStep}, message type: ${message.type}`);
 
@@ -522,7 +522,7 @@ async function handleVoiceConversation(workerId, worker, message, language) {
 
     console.log(`[VoiceAI] Worker ${workerId} said: "${transcription}"`);
 
-    if (!transcription || transcription === 'Unknown' || transcription.length < 2) {
+    if (!transcription || transcription.length < 2) {
       const responseText = language === 'en'
         ? 'I could not understand the voice note. Please try again in a quieter place, or type your question.'
         : 'Voice note samajh nahi aaya. Kripya shant jagah se dobara boliye, ya apna sawaal type kariye.';
@@ -565,6 +565,14 @@ const LEX_INTENT_MAP = {
   Greeting: 'greeting',
   FallbackIntent: null, // Lex doesn't know → go to the LLM
 };
+
+const LLM_INTENTS = new Set(['check_progress', 'request_certificate', 'log_attendance', 'help', 'greeting']);
+const DEMO_INTENTS = new Set(['demo_fail', 'demo_certificate']);
+
+function isDemoPhone(phoneNumber) {
+  const digits = String(phoneNumber || '').replace(/\D/g, '');
+  return Boolean(digits) && config.demoPhoneNumbers.includes(digits);
+}
 
 async function detectIntent(text, language) {
   const lower = (text || '').toLowerCase();
@@ -664,8 +672,11 @@ Respond in EXACTLY this JSON format (no markdown):
     const jsonStr = response.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
     const result = JSON.parse(jsonStr);
 
+    // Only public intents may come from the LLM; anything else (including the demo intents) is help
+    const intentType = LLM_INTENTS.has(result.intent) ? result.intent : 'help';
+
     return {
-      type: result.intent || 'help',
+      type: intentType,
       confidence: Math.min(100, Math.max(0, Number(result.confidence) || 70)),
       detail: result.detail || '',
       source: 'llm',
@@ -687,6 +698,12 @@ async function executeIntent(intent, workerId, worker, phoneNumber, language) {
   const daysRemaining = Math.max(0, threshold - daysLogged);
   const pct = Math.round((daysLogged / threshold) * 100);
   const name = worker.name || '';
+
+  // Demo shortcuts write attendance and issue certificates, so only team numbers may use them
+  if (DEMO_INTENTS.has(intent.type) && !isDemoPhone(phoneNumber)) {
+    console.warn(`[Intent] Demo intent ${intent.type} blocked for non-team number`);
+    intent = { ...intent, type: 'help' };
+  }
 
   switch (intent.type) {
     case 'demo_fail': {
@@ -719,13 +736,34 @@ async function executeIntent(intent, workerId, worker, phoneNumber, language) {
     }
 
     case 'demo_certificate': {
-      // Fast-track certificate for demo: set days to threshold and generate
-      const { updateItem } = await import('../utils/dynamodb.js');
+      // Fast-track certificate for demo: eligibility counts verified logs, so fill past dates that
+      // have no log yet with approved demo logs (real logs are never overwritten), then generate
+      const { updateItem, putItem, queryItems } = await import('../utils/dynamodb.js');
+      const existingLogs = await queryItems(config.tables.attendance, 'worker_id = :wid', { ':wid': workerId });
+      const takenDates = new Set(existingLogs.map((l) => l.log_date));
+      let verified = existingLogs.filter(
+        (l) => l.verification_status === 'auto_approved' || l.verification_status === 'approved',
+      ).length;
+      for (let daysAgo = 1; verified < config.certificateThreshold; daysAgo++) {
+        const logDate = new Date(Date.now() - daysAgo * 86400000).toISOString().split('T')[0];
+        if (takenDates.has(logDate)) continue;
+        await putItem(config.tables.attendance, {
+          worker_id: workerId,
+          log_date: logDate,
+          timestamp: new Date().toISOString(),
+          verification_status: 'approved',
+          site_id: 'SITE-DEMO-001',
+          site_name: 'Demo Construction Site',
+          admin_action: 'demo',
+          admin_justification: 'Demo certificate shortcut',
+        });
+        verified++;
+      }
       await updateItem(
         config.tables.workers,
         { worker_id: workerId },
         'SET total_days_logged = :days',
-        { ':days': config.certificateThreshold },
+        { ':days': verified },
       );
       const certText = language === 'en'
         ? `Demo mode: Set your days to ${config.certificateThreshold}. Generating certificate now...`
@@ -867,9 +905,10 @@ async function processFullAttendance(workerId, worker, language, state, voiceTra
 
   try {
     const selfieKey = state.pending_selfie_key;
-    const latitude = state.pending_latitude || (config.environment === 'dev' ? 28.6139 : null);
-    const longitude = state.pending_longitude || (config.environment === 'dev' ? 77.2090 : null);
-    const voice = voiceTranscription || 'construction work at site';
+    const latitude = state.pending_latitude || (isDemoMode() ? 28.6139 : null);
+    const longitude = state.pending_longitude || (isDemoMode() ? 77.2090 : null);
+    // A skipped or failed voice note stays empty so voice verification flags it
+    const voice = voiceTranscription || null;
 
     // Clear the pending state
     await saveConversationState(workerId, workerId, {
@@ -960,8 +999,8 @@ async function handleAttendanceCheckIn(workerId, worker, message, language) {
     const voiceTranscription = message.caption || '';
 
     // Step 3: Extract GPS (from message location or demo defaults)
-    const latitude = message.latitude || (config.environment === 'dev' ? 28.6139 : null);
-    const longitude = message.longitude || (config.environment === 'dev' ? 77.2090 : null);
+    const latitude = message.latitude || (isDemoMode() ? 28.6139 : null);
+    const longitude = message.longitude || (isDemoMode() ? 77.2090 : null);
 
     // Step 4: Run Triple Verification locally (in production, Step Functions orchestrates this)
     // Run face + geo in parallel, then voice, then merge
