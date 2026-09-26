@@ -1,6 +1,13 @@
 import React, { useState } from 'react';
 import { useNavigate, Navigate } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
+
+/** Page to return to after login (e.g. an officer who opened a credential link), else the dashboard */
+function takePostLoginRedirect() {
+  const next = sessionStorage.getItem('postLoginRedirect');
+  sessionStorage.removeItem('postLoginRedirect');
+  return next && next.startsWith('/verify') ? next : '/dashboard';
+}
 import '../login.css';
 
 export default function LoginPage() {
@@ -13,7 +20,7 @@ export default function LoginPage() {
 
   // Redirect if already logged in (declaratively, not via navigate() during render)
   if (isAuthenticated) {
-    return <Navigate to="/dashboard" replace />;
+    return <Navigate to={takePostLoginRedirect()} replace />;
   }
 
   async function handleSubmit(e) {
@@ -23,7 +30,7 @@ export default function LoginPage() {
 
     try {
       await login(email, password);
-      navigate('/dashboard', { replace: true });
+      navigate(takePostLoginRedirect(), { replace: true });
     } catch (err) {
       setError(err.message || 'Invalid credentials');
     } finally {
