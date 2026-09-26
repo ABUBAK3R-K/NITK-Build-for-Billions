@@ -808,6 +808,42 @@ Resources:
             RestApiId: !Ref NirmanMitraApi
             Path: /api/officer/credential/{jti}/audit
             Method: GET
+        ListCompanies:
+          Type: Api
+          Properties:
+            RestApiId: !Ref NirmanMitraApi
+            Path: /api/admin/companies
+            Method: GET
+        CreateCompany:
+          Type: Api
+          Properties:
+            RestApiId: !Ref NirmanMitraApi
+            Path: /api/admin/companies
+            Method: POST
+        CompanyOverview:
+          Type: Api
+          Properties:
+            RestApiId: !Ref NirmanMitraApi
+            Path: /api/company/overview
+            Method: GET
+        CompanyRoster:
+          Type: Api
+          Properties:
+            RestApiId: !Ref NirmanMitraApi
+            Path: /api/company/roster
+            Method: GET
+        CompanyFlags:
+          Type: Api
+          Properties:
+            RestApiId: !Ref NirmanMitraApi
+            Path: /api/company/flags
+            Method: GET
+        CompanyMusterRoll:
+          Type: Api
+          Properties:
+            RestApiId: !Ref NirmanMitraApi
+            Path: /api/company/muster.csv
+            Method: GET
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref WorkersTable

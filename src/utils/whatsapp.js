@@ -173,30 +173,18 @@ export async function sendLocationRequest(phoneNumber, text) {
   }
 }
 
-/**
- * Send a message with up to 3 quick-reply buttons. A tap comes back as an interactive
- * button_reply, which parseMessage turns into text plus buttonId.
- * @param {string} phoneNumber
- * @param {string} text - Body text (max 1024 chars)
- * @param {Array<{id: string, title: string}>} buttons - Titles max 20 chars
- */
-export async function sendReplyButtons(phoneNumber, text, buttons) {
+/** Post an interactive message (list or reply buttons); logs instead of sending in demo mode */
+async function sendInteractive(phoneNumber, interactive, label) {
   const payload = {
     messaging_product: 'whatsapp',
     recipient_type: 'individual',
     to: phoneNumber,
     type: 'interactive',
-    interactive: {
-      type: 'button',
-      body: { text },
-      action: {
-        buttons: buttons.slice(0, 3).map((b) => ({ type: 'reply', reply: { id: b.id, title: b.title.slice(0, 20) } })),
-      },
-    },
+    interactive,
   };
 
   if (isDemoMode() || noWhatsAppToken()) {
-    console.log(`[WhatsApp STUB] Buttons → ${phoneNumber}: ${text} [${buttons.map((b) => b.title).join(' | ')}]`);
+    console.log(`[WhatsApp STUB] ${label} → ${phoneNumber}: ${interactive.body?.text}`);
     return { success: true, demo: true, messageId: `demo-${Date.now()}` };
   }
 
@@ -204,9 +192,45 @@ export async function sendReplyButtons(phoneNumber, text, buttons) {
     const response = await axios.post(apiUrl(), payload, { headers: headers() });
     return { success: true, messageId: response.data.messages?.[0]?.id };
   } catch (err) {
-    console.error('[WhatsApp] sendReplyButtons failed:', err.response?.status, JSON.stringify(err.response?.data));
+    console.error(`[WhatsApp] ${label} failed:`, err.response?.status, JSON.stringify(err.response?.data));
     throw err;
   }
+}
+
+/**
+ * Send a tap-able list menu. The worker's choice comes back as a list_reply whose id is the
+ * row id, so routing does not depend on the (translated) row title.
+ * @param {string} phoneNumber
+ * @param {object} menu
+ * @param {string} menu.body - Message text (max 1024 chars)
+ * @param {string} menu.button - Label of the button that opens the list (max 20 chars)
+ * @param {Array<{id: string, title: string, description?: string}>} menu.rows - Up to 10 rows (title max 24 chars)
+ */
+export async function sendListMenu(phoneNumber, { body, button, rows }) {
+  return sendInteractive(phoneNumber, {
+    type: 'list',
+    body: { text: body },
+    action: {
+      button,
+      sections: [{ title: 'Nirman Mitra', rows: rows.slice(0, 10) }],
+    },
+  }, 'sendListMenu');
+}
+
+/**
+ * Send up to three reply buttons. The choice comes back as a button_reply with the button id.
+ * @param {string} phoneNumber
+ * @param {string} body - Message text
+ * @param {Array<{id: string, title: string}>} buttons - Max 3, title max 20 chars
+ */
+export async function sendReplyButtons(phoneNumber, body, buttons) {
+  return sendInteractive(phoneNumber, {
+    type: 'button',
+    body: { text: body },
+    action: {
+      buttons: buttons.slice(0, 3).map((b) => ({ type: 'reply', reply: { id: b.id, title: b.title } })),
+    },
+  }, 'sendReplyButtons');
 }
 
 /**
