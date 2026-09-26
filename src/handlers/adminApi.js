@@ -29,6 +29,12 @@ import {
   getAdminByEmail,
   normalizeEmail,
 } from '../middleware/auth.js';
+import {
+  handleCompanyRoute,
+  handleAdminCompanyRoute,
+  parseSiteCompanyId,
+  CompanyError,
+} from './companyRoutes.js';
 
 /** Client error with a safe, generic message */
 class HttpError extends Error {
@@ -151,6 +157,15 @@ export const handler = async (event) => {
       return apiResponse(401, { error: 'Unauthorized — valid access token required' });
     }
 
+    // Company accounts are visibility-only: they reach /api/company/* and nothing else
+    if (admin.role === 'company') {
+      const companyResponse = await handleCompanyRoute(admin, event, path, method);
+      return companyResponse || apiResponse(403, { error: 'Forbidden — insufficient role' });
+    }
+    if (path.includes('/api/company/')) {
+      return apiResponse(403, { error: 'Forbidden — company accounts only' });
+    }
+
     // All /api/admin/* routes require admin or super_admin role
     if (path.includes('/api/admin/')) {
       if (!requireRole(admin, ['admin', 'super_admin'])) {
@@ -162,6 +177,9 @@ export const handler = async (event) => {
     if (path.includes('/api/admin/dashboard')) {
       return await getDashboardStats();
     }
+
+    const companyAdminResponse = await handleAdminCompanyRoute(event, path, method);
+    if (companyAdminResponse) return companyAdminResponse;
 
     if (path.endsWith('/api/admin/sites')) {
       if (method === 'GET') return await listSites();
@@ -186,6 +204,9 @@ export const handler = async (event) => {
     }
 
     if (path.includes('/api/worker/') && path.includes('/progress')) {
+      if (!requireRole(admin, ['admin', 'super_admin'])) {
+        return apiResponse(403, { error: 'Forbidden — insufficient role' });
+      }
       return await getWorkerProgress(path);
     }
 
@@ -203,7 +224,7 @@ export const handler = async (event) => {
 
     return apiResponse(404, { error: 'Route not found' });
   } catch (err) {
-    if (err instanceof HttpError) {
+    if (err instanceof HttpError || err instanceof CompanyError) {
       return apiResponse(err.statusCode, { error: err.message });
     }
     // Never echo internal error details to the client
@@ -248,6 +269,7 @@ async function handleLogin(event) {
       email: admin.email,
       name: admin.name,
       role: admin.role,
+      ...(admin.company_id && { company_id: admin.company_id, company_name: admin.company_name || admin.name }),
     },
   });
 }
@@ -774,6 +796,7 @@ function siteView(site) {
     longitude: site.geo_location?.longitude ?? null,
     radius_meters: site.radius_meters ?? null,
     is_active: site.is_active === 'true' || site.is_active === true,
+    ...(site.company_id && { company_id: site.company_id }),
     created_at: site.created_at || null,
     updated_at: site.updated_at || null,
   };
@@ -814,6 +837,9 @@ async function upsertSite(event) {
     else throw badRequest('is_active must be a boolean');
   }
 
+  // Optional owning company (visibility only); '' or null removes it
+  const companyId = parseSiteCompanyId(body.company_id);
+
   const siteId = siteIdInput || `SITE-${randomUUID()}`;
   const existing = siteIdInput ? await getItem(config.tables.sites, { site_id: siteId }) : null;
   const now = new Date().toISOString();
@@ -829,6 +855,8 @@ async function upsertSite(event) {
     updated_at: now,
   };
   delete site.name;
+  if (companyId === null) delete site.company_id;
+  else if (companyId !== undefined) site.company_id = companyId;
 
   await putItem(config.tables.sites, site);
   return apiResponse(existing ? 200 : 201, { site: siteView(site), created: !existing });
