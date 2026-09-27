@@ -1,27 +1,83 @@
 # Nirman Mitra
 
-**Voice-first WhatsApp assistant that helps construction workers build verifiable proof of work days, and lets welfare board officers verify that proof.**
+**Proof of work days for construction workers, built on WhatsApp**
 
-Workers check in daily with a selfie, their location, and a voice note. Each check-in is verified by three independent checks: face, geo-fence, and voice intent. Verified days add up to a digitally signed work certificate. See [PRD.md](PRD.md) for the full product requirements.
+Voice-first on WhatsApp | English, Hindi, Kannada
+
+> **NITK Build for Billions 2026** | Team StrawHats
+
+---
+
+## The Problem
+
+A construction worker can register with their state welfare board, and so qualify for its benefits, only after proving **90 days of building work in the past 12 months** [[R2]](docs/REFERENCES.md#problem-statistics). That proof usually needs a contractor's signature, and the contractor has every reason not to sign.
+
+The system fails in both directions: genuine workers are turned away, fake ones get paid, and the money sits unspent. One cause is that nobody can verify a day of work.
+
+| Metric                                  | Figure                                                                                                                        |
+| --------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| Construction workers in India           | 7.1 crore working in the sector, 5.65 crore registered [[R1]](docs/REFERENCES.md#problem-statistics)                           |
+| Genuine workers turned away (Haryana)   | 10,81,809 applied between 2018 and Jan 2025; **8,06,148 rejected** [[R3]](docs/REFERENCES.md#problem-statistics)               |
+| Fake workers on the rolls (Karnataka)   | **19 lakh of 51 lakh** cards cancelled as bogus [[R4]](docs/REFERENCES.md#problem-statistics)                                  |
+| Welfare cess collected but unspent      | **About ₹48,000 crore** (₹1,12,331 crore collected, 57.15% spent, as on 31 Mar 2024) [[R5]](docs/REFERENCES.md#problem-statistics) |
+
+## The Solution
+
+Nirman Mitra ("builder's friend") is a voice-first assistant on WhatsApp. It works in four steps:
+
+1. **Check in daily:** the worker sends a selfie, their current location and a short voice note.
+2. **Automatic verification:** each check-in is checked at once.
+3. **Credential:** when enough days are verified, the worker receives a **digitally signed work credential** with a QR code.
+4. **Officer verification:** a welfare board officer scans the QR and the signature is verified **in the browser, with no call to our server**.
+
+No app to install, no forms, and no contractor sign-off.
 
 ### Core Innovation: Triple Verification
 
-Every attendance log is verified through three independent AI channels simultaneously:
+Every check-in goes through three independent checks, run in parallel:
 
-| Channel | AI/Cloud Service | What It Catches |
-|---|---|---|
-| **Face Match** | Amazon Rekognition | Buddy-punching, fake identities |
-| **Geo-Fence** | GPS + Site matching | Off-site check-ins, spoofing |
-| **Voice Intent** | Groq (Whisper + LLM) | Fake check-ins, scripted messages, unintelligible audio |
+
+| Channel          | Service                                                             | What It Catches                              |
+| ---------------- | ------------------------------------------------------------------- | -------------------------------------------- |
+| **Face Match**   | Amazon Rekognition (1:1 against the enrolled selfie)                | Proxy check-ins, wrong person                |
+| **Geo-Fence**    | WhatsApp current location + distance to the nearest registered site | Off-site check-ins                           |
+| **Voice Intent** | Groq Whisper (speech-to-text) + LLM check                           | Empty or scripted notes, replayed recordings |
+
+**Decision rules:**
+
+
+| Result            | When                                                                                              |
+| ----------------- | ------------------------------------------------------------------------------------------------- |
+| **Auto-approved** | Face ≥ 60, location ≥ 60,**and** a spoken note that describes work and says the one-time number |
+| **Rejected**      | Face < 30, more than 2× the site radius away, or the wrong one-time number                       |
+| **Admin review**  | Anything else. The worker gets a WhatsApp message when the reviewer decides.                      |
+
+### Anti-Misuse
+
+
+| Misuse                           | How it is caught                                               |
+| -------------------------------- | -------------------------------------------------------------- |
+| Re-sending an old selfie         | Image hash compared with the worker's recent check-ins         |
+| Forwarded photo or voice note    | WhatsApp's forwarded flag; rejected                            |
+| Picking a place on the map       | Only "current location" is accepted; pinned places are refused |
+| Replaying an old voice note      | A random two-digit number must be spoken in every check-in     |
+| Typing instead of speaking       | Allowed, but only a spoken note can auto-approve               |
+| Selfie now, location hours later | All three parts must arrive within 10 minutes                  |
+| Two check-ins in a day           | One record per worker per IST date (conditional write)         |
+
+**Known gaps:** mock-location apps, edited gallery photos, photos of a screen, and one person holding two numbers. Each gap and its planned fix is listed in [PRD §8](PRD.md#8-known-gaps-anti-misuse-roadmap).
 
 ### The Four Zeros
 
-| Principle | How |
-|---|---|
-| **Zero Literacy** | Voice-first via WhatsApp voice notes + Amazon Polly TTS (or native text) |
-| **Zero Downloads** | WhatsApp only — no app installation required |
-| **Zero Contractor Dependency** | AI self-verification replaces employer sign-off |
-| **Zero Typing** | Voice input + camera — no text entry required |
+
+| Principle                      | How                                                                                               |
+| ------------------------------ | ------------------------------------------------------------------------------------------------- |
+| **Zero Literacy**              | Voice notes in; spoken replies out (Amazon Polly, in Hindi and English); buttons for every choice |
+| **Zero Downloads**             | WhatsApp only                                                                                     |
+| **Zero Contractor Dependency** | Self-verification replaces the employer's signature                                               |
+| **Zero Typing**                | Camera, location button and voice cover the daily flow                                            |
+
+Polly has no Kannada voice yet, so Kannada replies are text only.
 
 ## Architecture
 
@@ -39,76 +95,70 @@ flowchart LR
     H --> B[(S3)]
     O[Officer / Admin browser] --> A[React dashboard<br/>on Amplify]
     A --> G
-
-
 ```
 
 ### Deliberate Architectural Decisions
 
-| Decision | Choice | Why Not Alternative |
-|---|---|---|
-| **Database** | DynamoDB | RDS adds VPC cold starts and fixed costs; DynamoDB scales to zero. |
-| **Compute** | AWS Lambda | EC2/ECS adds idle cost; Lambda auto-scales per webhook request. |
-| **Orchestration** | AWS Step Functions | SQS chaining loses state easily; Step Functions gives visual debugging and parallel branch execution. |
-| **LLM & STT** | Groq (Whisper + Llama/GPT-OSS) | Amazon Transcribe was too slow (~10-20s polling). Groq Whisper transcribes in ~1 second. |
-| **Frontend** | AWS Amplify | Simplifies React CI/CD and hosting with minimal configuration. |
 
-### Cost Analysis
+| Decision           | Choice                                                                      | Why Not the Alternative                                                             |
+| ------------------ | --------------------------------------------------------------------------- | ----------------------------------------------------------------------------------- |
+| **Channel**        | WhatsApp Cloud API                                                          | A separate app means an install, storage space and a new interface to learn         |
+| **Compute**        | AWS Lambda                                                                  | No idle servers; scales per webhook                                                 |
+| **Async work**     | Webhook acknowledges at once, then the Lambda invokes itself asynchronously | Meta retries slow webhooks; the three checks then run in parallel in one invocation |
+| **Database**       | DynamoDB, on-demand                                                         | No VPC or fixed cost; conditional writes stop duplicate check-ins                   |
+| **Speech-to-text** | Groq Whisper                                                                | Amazon Transcribe batch jobs need to be polled; Whisper returns in a single call    |
+| **LLM**            | Groq`openai/gpt-oss-120b` behind a provider interface                       | Pay per token; the provider can be swapped in one file                              |
+| **Credential**     | ES256-signed JWT, public key published as`did:web`                          | Officers verify offline in the browser; no lookup against our server                |
+| **Frontend**       | React + Vite on AWS Amplify                                                 | Builds and deploys on every push                                                    |
+| **Region**         | ap-south-1 (Mumbai)                                                         | Closest to the users                                                                |
 
-| Component | Description | Cost Profile |
-|---|---|---|
-| Groq Whisper & LLM | Ultra-fast STT and Intent extraction | Extremely low cost / API tokens |
-| Amazon DynamoDB | On-demand state management and logs | PAY_PER_REQUEST, scales to zero |
-| AWS Lambda | Event-driven compute | Free tier covers most startup traffic |
-| Amazon Rekognition | 1 `CompareFaces` per attendance log | ~$1.00 per 1,000 matches |
-| Amazon Textract | Only during worker onboarding (Aadhaar/Passbook) | ~$1.50 per 1,000 pages |
-| Amazon Polly | Text-to-Speech replies (Hindi, etc.) | Pay per character, heavily cached |
+### Cost
 
-### AWS Services Utilized
+Estimated at list prices; the full working and price sources are in [docs/REFERENCES.md](docs/REFERENCES.md#cost-per-check-in-working).
 
-- **Amazon Rekognition:** Facial verification (1:1 matching) + liveness/quality detection.
-- **Amazon Textract:** OCR for Aadhaar and Bank Passbooks during onboarding.
-- **Amazon Polly:** Neural TTS for voice replies in Indian languages.
-- **Amazon S3:** Raw media, processed output, and generated PDF certificates.
-- **Amazon DynamoDB:** User state, attendance logs, and site definitions.
-- **AWS Lambda:** Serverless handlers for webhooks and business logic.
-- **AWS Step Functions:** Asynchronous workflow orchestration.
-- **Amazon SQS:** Decoupled webhook processing with Dead Letter Queues (DLQ).
-- **Amazon API Gateway:** REST APIs for WhatsApp webhooks and Admin dashboard.
-- **AWS KMS:** Encryption of sensitive data (like Aadhaar images).
-- **AWS CloudFormation (SAM):** Infrastructure as Code (single `template.yaml`).
-- **AWS Amplify:** Hosting for the React admin dashboard.
+
+| Component                                    | Per check-in (USD) |
+| -------------------------------------------- | ------------------ |
+| Polly spoken replies (about 250 characters)  | 0.00400            |
+| Rekognition face match                       | 0.00125            |
+| Groq LLM voice check (upper bound)           | 0.00057            |
+| Groq Whisper (15-second note)                | 0.00017            |
+| Lambda, API Gateway, DynamoDB                | 0.00024            |
+| WhatsApp replies (inside the service window) | 0                  |
+| **Total**                                    | **≈ 0.0062**      |
+
+**About $0.14 per worker per month** (22 check-ins), or about **$1,370 per month for 10,000 workers**. Spoken replies are about 65% of that, and caching fixed phrases would remove most of it.
 
 ## Quick Start
 
 ### Prerequisites
+
 - Node.js 20+
 - AWS CLI v2 and AWS SAM CLI
-- WhatsApp Cloud API App (Meta Developer Console)
-- Groq API Key
+- A WhatsApp Cloud API app (Meta for Developers)
+- A Groq API key
 
 ### Configuration
-Copy `.env.example` to `.env` and fill in your values. Never commit real secrets. In AWS, these values are passed to the stack via SAM parameters (`NoEcho`).
+
+Copy `.env.example` to `.env` and fill in your values. Never commit real secrets. In AWS, the same values are passed to the stack as SAM parameters (`NoEcho`).
 
 ### Deploy Backend
 
 ```bash
-# Install dependencies
 npm install
-
-# Build the Lambda functions
 sam build
-
-# Deploy (first time requires --guided to set parameters)
-sam deploy --guided
+sam deploy --guided   # first deploy; asks for the parameters
 ```
 
 After deploying:
+
 1. Set the stack output `WhatsAppWebhookUrl` as the callback URL in your Meta app.
-2. Use the exact verify token you passed as `WhatsAppVerifyToken`.
+2. Use the same verify token you passed as `WhatsAppVerifyToken`.
 3. Subscribe the webhook to the `messages` field.
 
-### Deploy Frontend (Local Dev)
+Pushing to `master` runs the tests and deploys the backend and dashboard through GitHub Actions.
+
+### Run the Dashboard Locally
 
 ```bash
 cd admin-dashboard
@@ -116,44 +166,65 @@ npm install
 echo "VITE_API_URL=<your-api-gateway-endpoint>" > .env
 npm run dev
 ```
-*Note: To deploy the dashboard to production, you can link the `admin-dashboard` directory to an AWS Amplify app.*
 
 ### Create the First Admin User
+
 ```bash
 curl -X POST "$API_URL/api/auth/seed" \
   -H "Content-Type: application/json" \
   -d '{"email":"admin@example.com","password":"<strong-password>","name":"Admin","seedSecret":"<AdminSeedSecret>"}'
 ```
 
-### Demo Mode
+### Tests
 
-The project runs in demo mode by default if `ENVIRONMENT=dev`:
-- **Demo Keywords:** Supported phone numbers can trigger quick demo paths.
-- **Certificate Threshold:** Set to **3 days** (instead of 90) for quick demonstrations.
-- **Voice Fallback:** If audio is too short, mock demo transcriptions are returned.
+```bash
+npm test      # node:test suites with mocked AWS, WhatsApp and Groq
+npm run lint
+```
+
+### Demo Settings
+
+- **Certificate threshold:** 3 verified days instead of 90 (`CertificateThreshold`).
+- **Team shortcuts:** only numbers listed in `DEMO_PHONE_NUMBERS` can use the demo keywords.
 
 ## Project Structure
 
 ```
 nirman-mitra/
-  ├── PRD.md                    # Product requirements and specs
+  ├── README.md
+  ├── PRD.md                    # Product requirements, anti-misuse rules, known gaps
+  ├── docs/REFERENCES.md        # Sources for every number in this README
   ├── template.yaml             # AWS SAM template (API, Lambdas, tables, buckets)
   ├── src/
-  │   ├── handlers/             # Lambda entry points (webhook, attendance, certs, admin API)
-  │   ├── services/             # Business logic (registration, document OCR, voice processing)
-  │   ├── providers/llm.js      # LLM provider interface (Groq API)
+  │   ├── handlers/             # Lambda entry points: webhook, attendance, certificates, admin and company API
+  │   ├── services/             # Registration, consent, signed credential, OCR, voice, audit
+  │   ├── providers/llm.js      # LLM provider interface (Groq)
   │   ├── middleware/auth.js    # JWT verification for the admin API
-  │   ├── stepFunctions/        # AWS Step Functions state machine definitions (ASL)
-  │   └── utils/                # Config, DynamoDB, S3, WhatsApp client, helpers
-  └── admin-dashboard/          # React + Vite admin dashboard and verify page
+  │   └── utils/                # Config, DynamoDB, S3, WhatsApp client, translations
+  ├── tests/                    # node:test suites
+  └── admin-dashboard/          # React + Vite: admin, company and officer verification portal
 ```
 
 ## Security & Privacy
-- **KMS Encryption:** Sensitive documents like Aadhaar are encrypted at rest.
-- **PII Masking:** Only the last 4 digits of Aadhaar are stored in the database.
-- **Least-privilege IAM:** Each Lambda function has a dedicated execution role with strict permissions.
-- **S3 Public Access Blocked:** All backend buckets are strictly private.
+
+- **Consent first:** no selfie, document or voice is collected until the worker taps "I agree" on a short notice in their language. The consent is recorded.
+- **Aadhaar:** only the last 4 digits are stored. The full number is checked with the Verhoeff checksum in memory, then discarded. The card image and number are never sent to an LLM.
+- **Masked data:** phone numbers are masked in admin and company views.
+- **Audit log:** every officer view and every approve or reject decision is written to an append-only audit log.
+- **Webhook authentication:** requests are checked against Meta's `X-Hub-Signature-256`; the admin API sits behind JWT.
+- **Storage:** all buckets are encrypted at rest (SSE-S3, AES-256) and block public access.
+- **Least privilege:** each Lambda function gets only the table and bucket permissions it uses.
+
+## Impact
+
+
+| SDG                            | Contribution                                                                                                               |
+| ------------------------------ | -------------------------------------------------------------------------------------------------------------------------- |
+| SDG 1 · No Poverty            | Opens a route for workers to the about ₹48,000 crore of welfare cess still unspent [[R5]](docs/REFERENCES.md#problem-statistics) |
+| SDG 8 · Decent Work           | Gives workers a verifiable record of their days worked                                                                     |
+| SDG 10 · Reduced Inequalities | Voice-first design for workers who cannot read or type                                                                     |
+| SDG 16 · Strong Institutions  | Signed, audited credentials that officers can check without trusting a middleman                                           |
 
 ## Team
 
-**StrawHats** | NITK Build for Billions Hackathon
+**StrawHats** | NITK Build for Billions
