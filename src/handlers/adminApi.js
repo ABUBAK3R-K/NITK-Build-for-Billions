@@ -6,6 +6,7 @@
 
 import { randomUUID } from 'crypto';
 import config, { apiResponse } from '../utils/config.js';
+import { generatePresignedUrl, enrolledSelfieKey } from '../utils/s3.js';
 import {
   getItem,
   putItem,
@@ -547,11 +548,25 @@ async function getReviewQueue(event) {
   const enriched = await Promise.all(
     items.map(async (item) => {
       const worker = await getItem(config.tables.workers, { worker_id: item.worker_id });
+      
+      let enrolled_image_url = null;
+      let checkin_image_url = null;
+      try {
+        enrolled_image_url = await generatePresignedUrl(config.buckets.mediaRaw, enrolledSelfieKey(item.worker_id), 900);
+        if (item.s3_media_keys && item.s3_media_keys.selfie) {
+          checkin_image_url = await generatePresignedUrl(config.buckets.mediaRaw, item.s3_media_keys.selfie, 900);
+        }
+      } catch (err) {
+        console.error('Failed to generate presigned URLs:', err);
+      }
+
       return {
         ...item,
         log_id: `${item.worker_id}#${item.log_date}`,
         worker_name: worker?.name || 'Unknown',
         worker_phone: maskPhone(worker?.phone_number),
+        enrolled_image_url,
+        checkin_image_url
       };
     }),
   );
