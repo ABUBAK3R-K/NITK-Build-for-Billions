@@ -26,69 +26,21 @@ Every attendance log is verified through three independent AI channels simultane
 ## Architecture
 
 ```mermaid
-flowchart TB
-    subgraph UserChannels ["User Channels"]
-        WA["WhatsApp Business API"]
-        AD["Admin Dashboard (React + Amplify)"]
-    end
+flowchart LR
+    W[Worker on WhatsApp] --> M[WhatsApp Cloud API]
+    M --> G[API Gateway]
+    G --> H[Lambda: message handler]
+    H --> R[Rekognition<br/>face 1:1]
+    H --> T[Textract<br/>Aadhaar OCR]
+    H --> S[Groq Whisper<br/>STT]
+    H --> L[Groq LLM<br/>intent + voice checks]
+    H --> P[Polly<br/>spoken replies]
+    H --> D[(DynamoDB)]
+    H --> B[(S3)]
+    O[Officer / Admin browser] --> A[React dashboard<br/>on Amplify]
+    A --> G
 
-    subgraph APILayer ["API Layer"]
-        APIGW["API Gateway (REST + CORS)"]
-    end
 
-    subgraph Compute ["Compute — Lambda Functions"]
-        MH["MessageHandler"]
-        AP["AttendanceProcessor"]
-        DV["DocumentVerifier"]
-        CG["CertificateGenerator"]
-        PR["ProactiveReminder"]
-        AA["AdminAPI"]
-    end
-
-    subgraph Orchestration ["Orchestration"]
-        SF1["OnboardingFlow (Step Functions)"]
-        SF2["AttendanceFlow (Step Functions)"]
-        SF3["CertificateFlow (Step Functions)"]
-    end
-
-    subgraph AI_ML ["AI/ML Services"]
-        GR["Groq LLM (Intent + Whisper STT)"]
-        TX["Textract OCR"]
-        RK["Rekognition Face"]
-        PL["Polly Neural TTS"]
-    end
-
-    subgraph DataLayer ["Data Layer"]
-        DDB[("DynamoDB (Tables + GSIs)")]
-        S3[("S3 Buckets (Raw / Processed / Certs)")]
-        KMS["KMS (CMKs)"]
-        SQS["SQS + DLQ"]
-    end
-
-    WA --> APIGW
-    AD --> APIGW
-    APIGW --> MH
-    APIGW --> AA
-    MH --> SF1
-    MH --> SF2
-    SF1 --> DV
-    SF2 --> AP
-    SF3 --> CG
-    AP --> RK
-    AP --> GR
-    DV --> TX
-    MH --> GR
-    MH --> PL
-    MH --> DDB
-    AP --> DDB
-    DV --> DDB
-    CG --> DDB
-    AA --> DDB
-    MH --> S3
-    DV --> S3
-    CG --> S3
-    DV --> KMS
-    MH --> SQS
 ```
 
 ### Deliberate Architectural Decisions
