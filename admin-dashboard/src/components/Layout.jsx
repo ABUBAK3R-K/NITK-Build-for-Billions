@@ -18,17 +18,12 @@ import {
     LogOutIcon,
     WhatsAppIcon,
 } from './Icons';
+import useCollapsibleSidebar from '../utils/useCollapsibleSidebar';
 
 export default function Layout() {
     const [reviewCount, setReviewCount] = useState(0);
     const [isSidebarOpen, setIsSidebarOpen] = useState(false);
-    const [isCollapsed, setIsCollapsed] = useState(() => {
-        try {
-            return localStorage.getItem('nm_sidebar_collapsed') === 'true';
-        } catch {
-            return false;
-        }
-    });
+    const [isCollapsed, toggleCollapse] = useCollapsibleSidebar('nm_sidebar_collapsed');
 
     const { admin, logout } = useAuth();
     const navigate = useNavigate();
@@ -51,16 +46,6 @@ export default function Layout() {
     }, [refreshReviewCount]);
 
     const toggleSidebar = () => setIsSidebarOpen(!isSidebarOpen);
-
-    const toggleCollapse = () => {
-        setIsCollapsed(prev => {
-            const next = !prev;
-            try {
-                localStorage.setItem('nm_sidebar_collapsed', String(next));
-            } catch {}
-            return next;
-        });
-    };
 
     async function handleLogout() {
         await logout();

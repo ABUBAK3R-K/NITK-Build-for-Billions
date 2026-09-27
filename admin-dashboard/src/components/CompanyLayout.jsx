@@ -12,6 +12,7 @@ import {
     CloseIcon,
     LogOutIcon,
 } from './Icons';
+import useCollapsibleSidebar from '../utils/useCollapsibleSidebar';
 
 const NAV = [
     { to: '/company', end: true, icon: BarChartIcon, label: 'Overview' },
@@ -22,26 +23,10 @@ const NAV = [
 /** Frame for construction-company users: their own sites only, read-only */
 export default function CompanyLayout() {
     const [isSidebarOpen, setIsSidebarOpen] = useState(false);
-    const [isCollapsed, setIsCollapsed] = useState(() => {
-        try {
-            return localStorage.getItem('nm_company_sidebar_collapsed') === 'true';
-        } catch {
-            return false;
-        }
-    });
+    const [isCollapsed, toggleCollapse] = useCollapsibleSidebar('nm_company_sidebar_collapsed');
 
     const { admin, logout } = useAuth();
     const navigate = useNavigate();
-
-    const toggleCollapse = () => {
-        setIsCollapsed(prev => {
-            const next = !prev;
-            try {
-                localStorage.setItem('nm_company_sidebar_collapsed', String(next));
-            } catch {}
-            return next;
-        });
-    };
 
     async function handleLogout() {
         await logout();

@@ -155,9 +155,12 @@ body {
     display: none;
 }
 
+/* 72px can't fit the logo and the toggle side by side, so stack them */
 .sidebar.collapsed .sidebar-header {
-    padding: 18px 12px;
+    padding: 16px 0 12px;
+    flex-direction: column;
     justify-content: center;
+    gap: 10px;
 }
 
 .sidebar-nav {
@@ -578,6 +581,10 @@ table tr:hover td {
 @media (max-width: 768px) {
     .sidebar-toggle {
         display: flex;
+    }
+
+    .sidebar-collapse-btn {
+        display: none;
     }
 
     .sidebar-backdrop {
