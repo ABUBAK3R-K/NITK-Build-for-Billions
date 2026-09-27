@@ -26,43 +26,43 @@ Every attendance log is verified through three independent AI channels simultane
 ## Architecture
 
 ```mermaid
-graph TB
-    subgraph "User Channels"
-        WA[WhatsApp Business API]
-        AD[Admin Dashboard<br/>React + Amplify]
+flowchart TB
+    subgraph UserChannels ["User Channels"]
+        WA["WhatsApp Business API"]
+        AD["Admin Dashboard (React + Amplify)"]
     end
 
-    subgraph "API Layer"
-        APIGW[API Gateway<br/>REST + CORS]
+    subgraph APILayer ["API Layer"]
+        APIGW["API Gateway (REST + CORS)"]
     end
 
-    subgraph "Compute — Lambda Functions"
-        MH[MessageHandler]
-        AP[AttendanceProcessor]
-        DV[DocumentVerifier]
-        CG[CertificateGenerator]
-        PR[ProactiveReminder]
-        AA[AdminAPI]
+    subgraph Compute ["Compute — Lambda Functions"]
+        MH["MessageHandler"]
+        AP["AttendanceProcessor"]
+        DV["DocumentVerifier"]
+        CG["CertificateGenerator"]
+        PR["ProactiveReminder"]
+        AA["AdminAPI"]
     end
 
-    subgraph "Orchestration"
-        SF1[OnboardingFlow<br/>Step Functions]
-        SF2[AttendanceFlow<br/>Step Functions]
-        SF3[CertificateFlow<br/>Step Functions]
+    subgraph Orchestration ["Orchestration"]
+        SF1["OnboardingFlow (Step Functions)"]
+        SF2["AttendanceFlow (Step Functions)"]
+        SF3["CertificateFlow (Step Functions)"]
     end
 
-    subgraph "AI/ML Services"
-        GR[Groq LLM<br/>Intent Extraction + Whisper STT]
-        TX[Textract OCR]
-        RK[Rekognition Face]
-        PL[Polly Neural TTS]
+    subgraph AI_ML ["AI/ML Services"]
+        GR["Groq LLM (Intent + Whisper STT)"]
+        TX["Textract OCR"]
+        RK["Rekognition Face"]
+        PL["Polly Neural TTS"]
     end
 
-    subgraph "Data Layer"
-        DDB[(DynamoDB<br/>Tables + GSIs)]
-        S3[(S3 — Buckets<br/>Raw / Processed / Certs)]
-        KMS[KMS — CMKs]
-        SQS[SQS + DLQ]
+    subgraph DataLayer ["Data Layer"]
+        DDB[("DynamoDB (Tables + GSIs)")]
+        S3[("S3 Buckets (Raw / Processed / Certs)")]
+        KMS["KMS (CMKs)"]
+        SQS["SQS + DLQ"]
     end
 
     WA --> APIGW
