@@ -30,7 +30,6 @@ function normaliseWorker(w = {}) {
         total_days_logged: Number(w.total_days_logged) || 0,
         aadhaar_verified: w.aadhaar_verified ?? !!w.aadhaar_last4,
         selfie_verified: w.selfie_verified ?? !!w.face_vector,
-        bank_verified: w.bank_verified ?? (!!w.bank_account_hash || !!w.registration_completed),
     };
 }
 
@@ -164,10 +163,13 @@ export default function WorkerSearch() {
                                         </td>
                                         <td><span className={`badge ${w.profile_status}`}>{w.profile_status}</span></td>
                                         <td>
-                                            <div style={{ display: 'flex', gap: '4px' }}>
-                                                <span title="Aadhaar">{w.aadhaar_verified ? '✅' : '❌'}</span>
-                                                <span title="Selfie">{w.selfie_verified ? '✅' : '❌'}</span>
-                                                <span title="Bank">{w.bank_verified ? '✅' : '❌'}</span>
+                                            <div style={{ display: 'flex', gap: '6px' }}>
+                                                <span className={`badge ${w.aadhaar_verified ? 'approved' : 'rejected'}`} style={{ fontSize: '10px', padding: '1px 5px' }}>
+                                                    {w.aadhaar_verified ? 'Aadhaar' : 'No ID'}
+                                                </span>
+                                                <span className={`badge ${w.selfie_verified ? 'approved' : 'rejected'}`} style={{ fontSize: '10px', padding: '1px 5px' }}>
+                                                    {w.selfie_verified ? 'Face' : 'No Face'}
+                                                </span>
                                             </div>
                                         </td>
                                     </tr>
@@ -230,7 +232,6 @@ export default function WorkerSearch() {
                                     {[
                                         { label: 'Aadhaar Card', verified: selectedWorker.aadhaar_verified },
                                         { label: 'Selfie (Face)', verified: selectedWorker.selfie_verified },
-                                        { label: 'Bank Passbook', verified: selectedWorker.bank_verified },
                                     ].map((doc, i) => (
                                         <div key={i} style={{ display: 'flex', justifyContent: 'space-between', padding: '8px 0', borderBottom: '1px solid var(--border-color)' }}>
                                             <span style={{ fontSize: '13px' }}>{doc.label}</span>

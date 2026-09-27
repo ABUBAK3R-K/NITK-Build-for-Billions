@@ -71,36 +71,52 @@ body {
     height: 100vh;
     z-index: 100;
     box-shadow: 2px 0 8px rgba(0, 0, 0, 0.04);
+    transition: width 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+    overflow: hidden;
+}
+
+.sidebar.collapsed {
+    width: 72px;
 }
 
 .sidebar-header {
-    padding: 24px 20px;
+    padding: 20px 16px;
     border-bottom: 3px solid transparent;
     border-image: linear-gradient(to right, #ff9933 33%, #ffffff 33%, #ffffff 66%, #138808 66%) 1;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    min-height: 72px;
 }
 
 .sidebar-logo {
     display: flex;
     align-items: center;
     gap: 12px;
+    overflow: hidden;
+    min-width: 0;
 }
 
 .sidebar-logo .logo-icon {
-    width: 40px;
-    height: 40px;
+    width: 38px;
+    height: 38px;
     background: var(--accent-gradient);
     border-radius: 10px;
     display: flex;
     align-items: center;
     justify-content: center;
-    font-size: 20px;
+    color: white;
+    flex-shrink: 0;
     box-shadow: 0 2px 8px rgba(19, 136, 8, 0.2);
 }
 
 .sidebar-logo h1 {
-    font-size: 18px;
+    font-size: 16px;
     font-weight: 700;
     color: var(--green-india);
+    white-space: nowrap;
+    line-height: 1.2;
 }
 
 .sidebar-logo span {
@@ -108,18 +124,57 @@ body {
     color: var(--text-muted);
     display: block;
     margin-top: 2px;
+    white-space: nowrap;
+}
+
+.sidebar-collapse-btn {
+    width: 28px;
+    height: 28px;
+    background: var(--bg-primary);
+    border: 1px solid var(--border-color);
+    border-radius: 6px;
+    color: var(--text-secondary);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    flex-shrink: 0;
+    transition: var(--transition);
+}
+
+.sidebar-collapse-btn:hover {
+    color: var(--saffron-dark);
+    border-color: var(--saffron);
+    background: var(--saffron-light);
+}
+
+.sidebar.collapsed .sidebar-logo h1,
+.sidebar.collapsed .sidebar-logo span,
+.sidebar.collapsed .nav-label-text,
+.sidebar.collapsed .admin-user-details {
+    display: none;
+}
+
+/* 72px can't fit the logo and the toggle side by side, so stack them */
+.sidebar.collapsed .sidebar-header {
+    padding: 16px 0 12px;
+    flex-direction: column;
+    justify-content: center;
+    gap: 10px;
 }
 
 .sidebar-nav {
     flex: 1;
-    padding: 16px 12px;
+    padding: 16px 10px;
+    overflow-y: auto;
+    overflow-x: hidden;
 }
 
 .sidebar-nav .nav-link {
     display: flex;
     align-items: center;
     gap: 12px;
-    padding: 12px 16px;
+    padding: 10px 14px;
     border-radius: var(--border-radius-sm);
     color: var(--text-secondary);
     text-decoration: none;
@@ -127,6 +182,13 @@ body {
     font-weight: 500;
     transition: var(--transition);
     margin-bottom: 4px;
+    position: relative;
+    white-space: nowrap;
+}
+
+.sidebar.collapsed .sidebar-nav .nav-link {
+    padding: 10px 0;
+    justify-content: center;
 }
 
 .sidebar-nav .nav-link:hover {
@@ -142,9 +204,12 @@ body {
 }
 
 .sidebar-nav .nav-link .icon {
-    font-size: 18px;
-    width: 24px;
-    text-align: center;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 20px;
+    height: 20px;
+    flex-shrink: 0;
 }
 
 .nav-badge {
@@ -157,6 +222,17 @@ body {
     border-radius: 10px;
 }
 
+.sidebar.collapsed .nav-badge {
+    position: absolute;
+    top: 6px;
+    right: 12px;
+    width: 7px;
+    height: 7px;
+    padding: 0;
+    border-radius: 50%;
+    margin-left: 0;
+}
+
 /* ── Main Content ──────────────────────────────────────────── */
 
 .main-content {
@@ -165,6 +241,11 @@ body {
     padding: 32px;
     min-height: 100vh;
     background: var(--bg-primary);
+    transition: margin-left 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.sidebar--collapsed .main-content {
+    margin-left: 72px;
 }
 
 .page-header {
@@ -500,6 +581,10 @@ table tr:hover td {
 @media (max-width: 768px) {
     .sidebar-toggle {
         display: flex;
+    }
+
+    .sidebar-collapse-btn {
+        display: none;
     }
 
     .sidebar-backdrop {

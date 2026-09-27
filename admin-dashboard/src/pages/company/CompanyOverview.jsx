@@ -2,6 +2,7 @@ import React, { useState, useEffect, useCallback } from 'react';
 import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid, Legend } from 'recharts';
 import api from '../../utils/api';
 import { networkErrorMessage } from '../../utils/events';
+import { CameraIcon, UsersIcon, FlagIcon, CertificateIcon } from '../../components/Icons';
 
 const TOOLTIP_STYLE = { background: '#ffffff', border: '1px solid #e2e8f0', borderRadius: '8px', color: '#1a1a2e' };
 
@@ -49,19 +50,27 @@ export default function CompanyOverview() {
 
             <div className="stat-grid">
                 <div className="stat-card">
-                    <div className="stat-icon attendance">📸</div>
+                    <div className="stat-icon attendance" style={{ color: 'var(--green-india)' }}>
+                        <CameraIcon size={24} />
+                    </div>
                     <div className="stat-info"><h3>{data.checkinsToday}</h3><p>Check-ins today ({data.verifiedToday} verified)</p></div>
                 </div>
                 <div className="stat-card">
-                    <div className="stat-icon workers">👷</div>
+                    <div className="stat-icon workers" style={{ color: 'var(--saffron-dark)' }}>
+                        <UsersIcon size={24} />
+                    </div>
                     <div className="stat-info"><h3>{data.workersLast30Days}</h3><p>Workers (last 30 days)</p></div>
                 </div>
                 <div className="stat-card">
-                    <div className="stat-icon reviews">🚩</div>
+                    <div className="stat-icon reviews" style={{ color: 'var(--danger)' }}>
+                        <FlagIcon size={24} />
+                    </div>
                     <div className="stat-info"><h3>{data.flaggedLast7Days}</h3><p>Flagged (last 7 days)</p></div>
                 </div>
                 <div className="stat-card">
-                    <div className="stat-icon certificates">📜</div>
+                    <div className="stat-icon certificates" style={{ color: 'var(--navy)' }}>
+                        <CertificateIcon size={24} />
+                    </div>
                     <div className="stat-info">
                         <h3>{data.welfare.eligible}</h3>
                         <p>Eligible for welfare ({data.welfare.closeToEligibility} close)</p>

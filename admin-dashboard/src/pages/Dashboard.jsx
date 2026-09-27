@@ -5,6 +5,7 @@ import {
 } from 'recharts';
 import api from '../utils/api';
 import { networkErrorMessage } from '../utils/events';
+import { UsersIcon, CameraIcon, ClockIcon, CertificateIcon } from '../components/Icons';
 
 export default function Dashboard() {
     const [stats, setStats] = useState(null);
@@ -99,19 +100,27 @@ export default function Dashboard() {
 
             <div className="stat-grid">
                 <div className="stat-card">
-                    <div className="stat-icon workers">👷</div>
+                    <div className="stat-icon workers" style={{ color: 'var(--saffron-dark)' }}>
+                        <UsersIcon size={24} />
+                    </div>
                     <div className="stat-info"><h3>{stats.active_workers}</h3><p>Active Workers</p></div>
                 </div>
                 <div className="stat-card">
-                    <div className="stat-icon attendance">📸</div>
+                    <div className="stat-icon attendance" style={{ color: 'var(--green-india)' }}>
+                        <CameraIcon size={24} />
+                    </div>
                     <div className="stat-info"><h3>{stats.total_days_logged}</h3><p>Total Days Logged</p></div>
                 </div>
                 <div className="stat-card">
-                    <div className="stat-icon reviews">⏳</div>
+                    <div className="stat-icon reviews" style={{ color: 'var(--saffron-dark)' }}>
+                        <ClockIcon size={24} />
+                    </div>
                     <div className="stat-info"><h3>{stats.pending_reviews}</h3><p>Pending Reviews</p></div>
                 </div>
                 <div className="stat-card">
-                    <div className="stat-icon certificates">📜</div>
+                    <div className="stat-icon certificates" style={{ color: 'var(--navy)' }}>
+                        <CertificateIcon size={24} />
+                    </div>
                     <div className="stat-info"><h3>{stats.total_workers}</h3><p>Total Registered</p></div>
                 </div>
             </div>
